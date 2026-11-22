@@ -1,0 +1,11 @@
+TikTokLive
+discord.py
+google-genai
+openai
+edge-tts
+gTTS
+pygame
+yt-dlp
+python-dotenv
+httpx
+imageio-ffmpeg
