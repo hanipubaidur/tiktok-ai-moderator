@@ -21,9 +21,9 @@
   },
   "konteks_live": {
     "topik_bahasan": "Obrolan santai dan tema sesuai sesi live",
-    "status_terbaru": "Live santai bareng penonton",
+    "status_terbaru": "tes",
     "mode_interaksi": "Host memantau di balik layar, AI aktif memimpin obrolan dan menjaga ketertiban room",
-    "diperbarui_pada": "2026-11-22 12:45"
+    "diperbarui_pada": "2026-11-22 18:50"
   },
   "protokol_moderasi": {
     "batas_maksimal_warn": 3,
@@ -496,7 +496,8 @@
     "kahpe",
     "pezevenk",
     "ibne",
-    "gerizekali"
+    "gerizekali",
+    "pucek"
   ],
   "banned_users": [],
   "faq": [
