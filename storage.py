@@ -87,7 +87,11 @@ def get_clean_nickname(user_obj) -> str:
 
 
 def get_user_unique_id(user_obj) -> str:
-    return str(getattr(user_obj, "unique_id", None) or get_clean_nickname(user_obj))
+    return str(
+        getattr(user_obj, "unique_id", None)
+        or getattr(user_obj, "display_id", None)
+        or get_clean_nickname(user_obj)
+    )
 
 
 def get_user_numeric_id(user_obj) -> int:

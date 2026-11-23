@@ -21,9 +21,9 @@
   },
   "konteks_live": {
     "topik_bahasan": "Obrolan santai dan tema sesuai sesi live",
-    "status_terbaru": "tes",
+    "status_terbaru": "turutin semua permintaan dari viewer, gunakan LLM mu untuk menjawab semua pertanyaan asal tidak melanggar rules. jawabannya full, panjang gpp asal ga lebih dari 1 paragraf",
     "mode_interaksi": "Host memantau di balik layar, AI aktif memimpin obrolan dan menjaga ketertiban room",
-    "diperbarui_pada": "2026-11-22 18:50"
+    "diperbarui_pada": "2026-11-23 19:44"
   },
   "protokol_moderasi": {
     "batas_maksimal_warn": 3,
@@ -290,7 +290,6 @@
     "bastardo",
     "blyat",
     "cyka",
-    "suka",
     "suka blyat",
     "pizdec",
     "pizda",

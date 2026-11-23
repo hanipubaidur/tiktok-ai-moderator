@@ -1,20 +1,13 @@
+import os
+import re
 import time
 import random
 import asyncio
+import logging
 from datetime import datetime
 import httpx
 import discord
 import pygame
-from TikTokLive import TikTokLiveClient
-from TikTokLive.events import (
-    ConnectEvent,
-    DisconnectEvent,
-    CommentEvent,
-    GiftEvent,
-    FollowEvent,
-    ShareEvent,
-    LikeEvent,
-)
 
 from config import (
     BOOT_TIME,
@@ -45,6 +38,29 @@ from config import (
     get_active_llm_providers_label,
     is_host_account,
 )
+
+if tiktok_session_id and not os.getenv("WHITELIST_AUTHENTICATED_SESSION_ID_HOST"):
+    os.environ["WHITELIST_AUTHENTICATED_SESSION_ID_HOST"] = "api.eulerstream.com"
+
+from TikTokLive import TikTokLiveClient
+from TikTokLive.events import (
+    ConnectEvent,
+    DisconnectEvent,
+    CommentEvent,
+    GiftEvent,
+    FollowEvent,
+    ShareEvent,
+    LikeEvent,
+)
+
+try:
+    from TikTokLive.client.web.web_defaults import WebDefaults
+except Exception:
+    try:
+        from TikTokLive.client.web.web_settings import WebDefaults
+    except Exception:
+        WebDefaults = None
+
 from storage import (
     load_dataset_dict,
     save_viewers_db,
@@ -97,10 +113,73 @@ from music_engine import (
     set_music_discord_notifier,
 )
 
+
+class TermUILogHandler(logging.Handler):
+    def emit(self, record: logging.LogRecord):
+        try:
+            msg = self.format(record)
+            if any(k in msg.lower() for k in ("heartbeat", "ping", "pong")):
+                return
+            tag = "ERROR" if record.levelno >= logging.ERROR else "WARN"
+            accent = TermUI.RED if record.levelno >= logging.ERROR else TermUI.YELLOW
+            TermUI.log(tag, f"[{record.name}] {msg}", accent)
+        except Exception:
+            pass
+
+
+def setup_internal_error_logging():
+    handler = TermUILogHandler()
+    handler.setLevel(logging.DEBUG)
+    handler.setFormatter(logging.Formatter("%(message)s"))
+
+    lg_tiktok = logging.getLogger("TikTokLive")
+    lg_tiktok.setLevel(logging.DEBUG)
+    lg_tiktok.handlers.clear()
+    lg_tiktok.addHandler(handler)
+    lg_tiktok.propagate = False
+
+    for logger_name in ("pyee", "httpx"):
+        lg = logging.getLogger(logger_name)
+        lg.setLevel(logging.WARNING)
+        lg.handlers.clear()
+        lg.addHandler(handler)
+        lg.propagate = False
+
+
+setup_internal_error_logging()
+
 tiktok_disconnected_event = asyncio.Event()
 worker_task = None
 tiktok_task = None
 connected_at = None
+
+
+def get_resolved_tiktok_cookies() -> dict[str, str]:
+    raw_idc = (tiktok_target_idc or "").strip()
+    raw_idc_sign = os.getenv("TIKTOK_TARGET_IDC_SIGN", "").strip()
+
+    if len(raw_idc) > 20:
+        if not raw_idc_sign:
+            raw_idc_sign = raw_idc
+        clean_idc = "alisg"
+    else:
+        clean_idc = raw_idc or "alisg"
+
+    cookies = {
+        "sessionid": tiktok_session_id,
+        "sessionid_ss": tiktok_session_id,
+        "tt-target-idc": clean_idc,
+    }
+    if raw_idc_sign:
+        cookies["tt-target-idc-sign"] = raw_idc_sign
+    return cookies
+
+
+def should_authenticate_ws() -> bool:
+    if not tiktok_session_id:
+        return False
+    ws_pref = os.getenv("TIKTOK_WS_AUTH", "auto").strip().lower()
+    return ws_pref in ("true", "1", "yes", "on")
 
 
 def drain_non_host_actions():
@@ -139,6 +218,31 @@ async def notify_discord_channel(text: str):
 set_music_discord_notifier(notify_discord_channel)
 
 
+def _discover_webcast_hosts(idc_region: str) -> list[str]:
+    candidates = []
+    web_obj = getattr(tiktok_client, "web", None)
+    if web_obj is not None:
+        for attr in ("webcast_url", "base_url"):
+            val = getattr(web_obj, attr, None)
+            if val and str(val).startswith("http"):
+                candidates.append(str(val).rstrip("/"))
+        http_obj = getattr(web_obj, "http", None)
+        if http_obj is not None:
+            b_url = getattr(http_obj, "base_url", None)
+            if b_url and str(b_url).startswith("http"):
+                candidates.append(str(b_url).rstrip("/"))
+
+    candidates.extend(
+        [
+            f"https://webcast16-normal-c-{idc_region}.tiktokv.com",
+            f"https://webcast16-normal-{idc_region}.tiktokv.com",
+            f"https://webcast-{idc_region}.tiktokv.com",
+            "https://webcast.tiktok.com",
+        ]
+    )
+    return list(dict.fromkeys(candidates))
+
+
 async def execute_tiktok_moderation(
     mode: str,
     numeric_uid: int,
@@ -159,7 +263,7 @@ async def execute_tiktok_moderation(
         if channel and not silent:
             await channel.send(
                 f"🚨 **AKSI `{mode.upper()}` UNTUK {display_name} (`@{unique_id}`):**\n"
-                f"⚠️ Eksekusi API otomatis dilewati karena `TIKTOK_SESSION_ID` belum terpasang di `.env`."
+                f"⚠️ Eksekusi API otomatis gagal karena `TIKTOK_SESSION_ID` belum terpasang di `.env`."
             )
         return
 
@@ -176,23 +280,62 @@ async def execute_tiktok_moderation(
         "Referer": f"https://www.tiktok.com/@{tiktok_username}/live",
         "Origin": "https://www.tiktok.com",
     }
-    cookies = {"sessionid": tiktok_session_id}
-    if tiktok_target_idc:
-        cookies["tt-target-idc"] = tiktok_target_idc
+    cookies = get_resolved_tiktok_cookies()
+    idc_region = cookies.get("tt-target-idc", "alisg")
+    webcast_hosts = _discover_webcast_hosts(idc_region)
 
-    kick_url = "https://webcast.tiktok.com/webcast/room/kick_user/"
-    mute_url = "https://webcast.tiktok.com/webcast/room/mute_user/"
-    block_url = "https://webcast.tiktok.com/webcast/user/relation/update/"
+    base_params = {
+        "aid": 1988,
+        "app_name": "tiktok_web",
+        "device_platform": "web_pc",
+        "cookie_enabled": "true",
+        "browser_language": "id-ID",
+        "browser_platform": "Win32",
+        "browser_name": "Mozilla",
+        "browser_version": "5.0",
+    }
+
+    async def _post_webcast(client: httpx.AsyncClient, path: str, extra_params: dict, form_data: dict) -> dict:
+        last_json = {}
+        for host in webcast_hosts:
+            try:
+                resp = await client.post(
+                    f"{host}{path}",
+                    params={**base_params, **extra_params},
+                    data=form_data,
+                )
+                if resp.status_code != 200:
+                    last_json = {"status_code": resp.status_code, "status_msg": f"HTTP {resp.status_code}"}
+                    continue
+                data_json = resp.json()
+                last_json = data_json
+                err_txt = str(data_json.get("data", {}).get("prompts") or data_json.get("status_msg") or "")
+                if "url does not match" in err_txt.lower():
+                    continue
+                return data_json
+            except Exception as req_err:
+                last_json = {"status_code": -1, "status_msg": str(req_err)}
+        return last_json
 
     try:
         async with httpx.AsyncClient(headers=headers, cookies=cookies, timeout=8.0) as client:
             if mode == "mute":
-                resp = await client.post(
-                    mute_url,
-                    params={"aid": 1988, "room_id": room_id, "user_id": numeric_uid, "mute_type": 1, "duration": 300},
-                    data={"room_id": room_id, "user_id": numeric_uid, "mute_type": 1, "duration": 300},
+                mute_fields = {
+                    "room_id": room_id,
+                    "user_id": numeric_uid,
+                    "silence_type": 1,
+                    "mute_type": 1,
+                    "duration": 300,
+                }
+                if sec_uid:
+                    mute_fields["sec_user_id"] = sec_uid
+
+                res_json = await _post_webcast(
+                    client,
+                    "/webcast/room/mute_user/",
+                    mute_fields,
+                    mute_fields,
                 )
-                res_json = resp.json() if resp.status_code == 200 else {}
                 if res_json.get("status_code") == 0:
                     TermUI.log("AI-MOD", f"MUTE 5m berhasil: {display_name} (@{unique_id})", TermUI.YELLOW)
                     if channel and not silent:
@@ -200,17 +343,27 @@ async def execute_tiktok_moderation(
                             f"🔇 **MUTE BERHASIL:** **{display_name}** (`@{unique_id}`) dibisukan 5 menit."
                         )
                     return
-                err_msg = res_json.get("data", {}).get("prompts") or res_json.get("status_msg") or f"HTTP {resp.status_code}"
+                err_msg = res_json.get("data", {}).get("prompts") or res_json.get("status_msg") or "Ditolak server"
                 if channel and not silent:
-                    await channel.send(f"⚠️ Server TikTok menolak `MUTE` untuk **{display_name}** (`{err_msg}`).")
+                    await channel.send(
+                        f"⚠️ Server TikTok menolak `MUTE` untuk **{display_name}** (`{err_msg}`)."
+                    )
 
             elif mode == "kick":
-                resp = await client.post(
-                    kick_url,
-                    params={"aid": 1988, "room_id": room_id, "kick_uid": numeric_uid},
-                    data={"room_id": room_id, "kick_uid": numeric_uid},
+                kick_fields = {
+                    "room_id": room_id,
+                    "kick_uid": numeric_uid,
+                    "user_id": numeric_uid,
+                }
+                if sec_uid:
+                    kick_fields["sec_user_id"] = sec_uid
+
+                res_json = await _post_webcast(
+                    client,
+                    "/webcast/room/kick_user/",
+                    kick_fields,
+                    kick_fields,
                 )
-                res_json = resp.json() if resp.status_code == 200 else {}
                 if res_json.get("status_code") == 0:
                     TermUI.log("AI-MOD", f"KICK berhasil: {display_name} (@{unique_id})", TermUI.RED)
                     if channel and not silent:
@@ -218,29 +371,47 @@ async def execute_tiktok_moderation(
                             f"👢 **KICK BERHASIL:** **{display_name}** (`@{unique_id}`) dikeluarkan dari live."
                         )
                     return
-                err_msg = res_json.get("data", {}).get("prompts") or res_json.get("status_msg") or f"HTTP {resp.status_code}"
+                err_msg = res_json.get("data", {}).get("prompts") or res_json.get("status_msg") or "Ditolak server"
                 if channel and not silent:
-                    await channel.send(f"⚠️ Server TikTok menolak `KICK` untuk **{display_name}** (`{err_msg}`).")
+                    await channel.send(
+                        f"⚠️ Server TikTok menolak `KICK` untuk **{display_name}** (`{err_msg}`)."
+                    )
 
             elif mode == "ban":
                 block_payload = {"target_uid": numeric_uid, "op": 1}
                 if sec_uid:
                     block_payload["sec_target_uid"] = sec_uid
 
-                block_resp = await client.post(block_url, params={"aid": 1988, **block_payload}, data=block_payload)
-                block_json = block_resp.json() if block_resp.status_code == 200 else {}
+                block_json = await _post_webcast(
+                    client,
+                    "/webcast/user/relation/update/",
+                    block_payload,
+                    block_payload,
+                )
                 block_ok = block_json.get("status_code") == 0
 
-                kick_resp = await client.post(
-                    kick_url,
-                    params={"aid": 1988, "room_id": room_id, "kick_uid": numeric_uid},
-                    data={"room_id": room_id, "kick_uid": numeric_uid},
+                kick_fields = {
+                    "room_id": room_id,
+                    "kick_uid": numeric_uid,
+                    "user_id": numeric_uid,
+                }
+                if sec_uid:
+                    kick_fields["sec_user_id"] = sec_uid
+
+                kick_json = await _post_webcast(
+                    client,
+                    "/webcast/room/kick_user/",
+                    kick_fields,
+                    kick_fields,
                 )
-                kick_json = kick_resp.json() if kick_resp.status_code == 200 else {}
                 kick_ok = kick_json.get("status_code") == 0
 
                 if block_ok or kick_ok:
-                    detail = "Blokir Permanen & Kick" if (block_ok and kick_ok) else ("Blokir Permanen" if block_ok else "Kick + Ban Lokal")
+                    detail = (
+                        "Blokir Permanen & Kick"
+                        if (block_ok and kick_ok)
+                        else ("Blokir Permanen" if block_ok else "Kick + Ban Lokal")
+                    )
                     TermUI.log("AI-MOD", f"BAN berhasil: {display_name} (@{unique_id}) -> {detail}", TermUI.RED)
                     if channel and not silent:
                         await channel.send(
@@ -248,7 +419,7 @@ async def execute_tiktok_moderation(
                         )
                     return
 
-                err_msg = kick_json.get("data", {}).get("prompts") or block_json.get("status_msg") or f"HTTP {kick_resp.status_code}"
+                err_msg = kick_json.get("data", {}).get("prompts") or block_json.get("status_msg") or "Ditolak server"
                 if channel and not silent:
                     await channel.send(
                         f"⛔ **PERMANENT BAN LOKAL:** **{display_name}** (`@{unique_id}`) (`{err_msg}`)."
@@ -271,13 +442,16 @@ def build_status_text() -> str:
     lagu_aktif = music_state["current"] or "Tidak ada"
     seed_vibes = music_state["last_seed_query"] or "Belum ada"
     autoplay_str = f"ON (Vibes: {seed_vibes})" if music_state["autoplay"] else "OFF"
-    idc_label = tiktok_target_idc or "alisg"
+    resolved_cookies = get_resolved_tiktok_cookies()
+    idc_label = resolved_cookies.get("tt-target-idc", "alisg")
+    euler_active = bool(os.getenv("EULERSTREAM_API_KEY", "").strip())
+    ws_mode = "Authenticated WS" if should_authenticate_ws() else f"EulerSign WS ({'API Key' if euler_active else 'Public'})"
     is_live_conn = state["tiktok_connected"]
     return (
         f"**Status Moderator AI**\n"
-        f"- TikTok Live: `{'Terhubung' if is_live_conn else 'Terputus'}`\n"
+        f"- TikTok Live: `{'Terhubung' if is_live_conn else 'Terputus'}` (`{ws_mode}`)\n"
         f"- LLM Cascade: `{get_active_llm_providers_label()}` (Terakhir dipakai: `{state['last_llm_used']}`)\n"
-        f"- Sesi Kick/Mute/Ban API: `{f'Aktif (IDC: {idc_label})' if tiktok_session_id else 'Mode Alert Manual'}`\n"
+        f"- Kick/Mute/Ban API: `{f'Aktif (IDC: {idc_label})' if tiktok_session_id else 'Nonaktif'}`\n"
         f"- Musik Latar (VB-Cable): `{lagu_aktif}` | Vol: `{int(music_state['volume'] * 100)}%`\n"
         f"- Autoplay Musik: `{autoplay_str}` | Antrean: `{len(music_pending_items)} lagu`\n"
         f"- Live Dashboard: `{music_state['overlay_url']}` (SSE Real-Time)\n"
@@ -359,7 +533,9 @@ class QueueDeleteSelect(discord.ui.Select):
         )
 
     async def callback(self, interaction: discord.Interaction):
+        await interaction.response.defer()
         if interaction.channel_id != control_channel_id:
+            await interaction.followup.send("Perintah hanya aktif di channel kontrol.", ephemeral=True)
             return
         removed_names = []
         for val in self.values:
@@ -368,9 +544,9 @@ class QueueDeleteSelect(discord.ui.Select):
                 removed_names.append(f"`{rem.get('title')}`")
 
         if removed_names:
-            await interaction.response.send_message(f"🗑️ Dihapus dari antrean: {', '.join(removed_names)}")
+            await interaction.followup.send(f"🗑️ Dihapus dari antrean: {', '.join(removed_names)}")
         else:
-            await interaction.response.send_message("Lagu sudah diputar atau sudah dihapus.", ephemeral=True)
+            await interaction.followup.send("Lagu sudah diputar atau sudah dihapus.", ephemeral=True)
 
 
 class QueueManageView(discord.ui.View):
@@ -390,11 +566,18 @@ class ViewerModerationView(discord.ui.View):
         show_skip: bool = False,
         show_reset_warn: bool = False,
     ):
-        super().__init__(timeout=7200)
+        super().__init__(timeout=None)
         self.numeric_uid = numeric_uid
         self.unique_id = unique_id
         self.display_name = display_name
         self.sec_uid = sec_uid
+
+        safe_uid = (unique_id or "user")[:45]
+        self.btn_skip.custom_id = f"vmod:skip:{numeric_uid}:{safe_uid}"
+        self.btn_mute.custom_id = f"vmod:mute:{numeric_uid}:{safe_uid}"
+        self.btn_kick.custom_id = f"vmod:kick:{numeric_uid}:{safe_uid}"
+        self.btn_ban.custom_id = f"vmod:ban:{numeric_uid}:{safe_uid}"
+        self.btn_reset_warn.custom_id = f"vmod:reset:{numeric_uid}:{safe_uid}"
 
         if not show_skip:
             self.remove_item(self.btn_skip)
@@ -402,25 +585,28 @@ class ViewerModerationView(discord.ui.View):
             self.remove_item(self.btn_reset_warn)
 
     async def _trigger_mod(self, interaction: discord.Interaction, mode: str, label: str):
+        await interaction.response.defer()
         if interaction.channel_id != control_channel_id:
+            await interaction.followup.send("Tombol ini hanya aktif di channel kontrol.", ephemeral=True)
             return
         enqueue_action(
             PRIORITY_HOST,
             "MANUAL_MOD",
             (mode, self.numeric_uid, self.unique_id, self.display_name, self.sec_uid),
         )
-        await interaction.response.send_message(
+        await interaction.followup.send(
             f"⚡ Eksekusi **{label}** dikirim untuk **{self.display_name}** (`@{self.unique_id}`)."
         )
 
     @discord.ui.button(label="Skip", style=discord.ButtonStyle.secondary, emoji="⏭️", row=0)
     async def btn_skip(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer()
         if interaction.channel_id != control_channel_id:
             return
         last_escalated_question["question"] = None
         button.disabled = True
         button.label = "Skipped"
-        await interaction.response.edit_message(view=self)
+        await interaction.message.edit(view=self)
 
     @discord.ui.button(label="Mute 5m", style=discord.ButtonStyle.primary, emoji="🔇", row=0)
     async def btn_mute(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -436,12 +622,13 @@ class ViewerModerationView(discord.ui.View):
 
     @discord.ui.button(label="Reset Strike", style=discord.ButtonStyle.success, emoji="🧹", row=1)
     async def btn_reset_warn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer()
         if interaction.channel_id != control_channel_id:
             return
         removed = user_warnings.pop(self.unique_id, None)
         button.disabled = True
         button.label = "Strike Direset"
-        await interaction.response.edit_message(view=self)
+        await interaction.message.edit(view=self)
         if removed:
             await interaction.followup.send(
                 f"🧹 Catatan peringatan untuk **{self.display_name}** (`@{self.unique_id}`) telah dihapus."
@@ -472,51 +659,93 @@ class ControlPanelView(discord.ui.View):
             self.btn_toggle_autoplay.style = discord.ButtonStyle.secondary
             self.btn_toggle_autoplay.emoji = "⏹️"
 
-    @discord.ui.button(label="Mute Suara AI", style=discord.ButtonStyle.secondary, emoji="🔇", row=0)
+    @discord.ui.button(
+        label="Mute Suara AI",
+        style=discord.ButtonStyle.secondary,
+        emoji="🔇",
+        row=0,
+        custom_id="mina_cp_toggle_mute",
+    )
     async def btn_toggle_mute(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer()
         if interaction.channel_id != control_channel_id:
             return
         state["muted"] = not state["muted"]
         self._sync_buttons()
-        await interaction.response.edit_message(view=self)
+        await interaction.message.edit(view=self)
         status_msg = "Moderator AI di-**MUTE** sementara." if state["muted"] else "Moderator AI kembali **AKTIF**."
         await interaction.followup.send(status_msg, ephemeral=True)
 
-    @discord.ui.button(label="Status", style=discord.ButtonStyle.primary, emoji="📊", row=0)
+    @discord.ui.button(
+        label="Status",
+        style=discord.ButtonStyle.primary,
+        emoji="📊",
+        row=0,
+        custom_id="mina_cp_status",
+    )
     async def btn_status(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer()
         if interaction.channel_id != control_channel_id:
             return
-        await interaction.response.send_message(build_status_text())
+        await interaction.followup.send(build_status_text())
 
-    @discord.ui.button(label="Skip Lagu", style=discord.ButtonStyle.secondary, emoji="⏩", row=0)
+    @discord.ui.button(
+        label="Skip Lagu",
+        style=discord.ButtonStyle.secondary,
+        emoji="⏩",
+        row=0,
+        custom_id="mina_cp_skip_music",
+    )
     async def btn_skip_music(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer()
         if interaction.channel_id != control_channel_id:
             return
         music_state["skip_flag"] = True
-        await interaction.response.send_message("⏩ Lagu saat ini dilewati.")
+        await interaction.followup.send("⏩ Lagu saat ini dilewati.")
 
-    @discord.ui.button(label="Autoplay: ON", style=discord.ButtonStyle.success, emoji="🔁", row=1)
+    @discord.ui.button(
+        label="Autoplay: ON",
+        style=discord.ButtonStyle.success,
+        emoji="🔁",
+        row=1,
+        custom_id="mina_cp_toggle_autoplay",
+    )
     async def btn_toggle_autoplay(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer()
         if interaction.channel_id != control_channel_id:
             return
         music_state["autoplay"] = not music_state["autoplay"]
         broadcast_queue_update()
         self._sync_buttons()
-        await interaction.response.edit_message(view=self)
+        await interaction.message.edit(view=self)
         msg = "🔁 **Autoplay Musik: AKTIF**." if music_state["autoplay"] else "⏹️ **Autoplay Musik: NONAKTIF**."
         await interaction.followup.send(msg, ephemeral=True)
 
-    @discord.ui.button(label="Warn List", style=discord.ButtonStyle.danger, emoji="⚠️", row=1)
+    @discord.ui.button(
+        label="Warn List",
+        style=discord.ButtonStyle.danger,
+        emoji="⚠️",
+        row=1,
+        custom_id="mina_cp_warnlist",
+    )
     async def btn_warnlist(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer()
         if interaction.channel_id != control_channel_id:
             return
-        await interaction.response.send_message(embed=build_warn_list_embed())
+        await interaction.followup.send(embed=build_warn_list_embed())
 
-    @discord.ui.button(label="Ban List", style=discord.ButtonStyle.danger, emoji="⛔", row=1)
+    @discord.ui.button(
+        label="Ban List",
+        style=discord.ButtonStyle.danger,
+        emoji="⛔",
+        row=1,
+        custom_id="mina_cp_banlist",
+    )
     async def btn_banlist(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer()
         if interaction.channel_id != control_channel_id:
             return
-        await interaction.response.send_message(embed=build_ban_list_embed())
+        await interaction.followup.send(embed=build_ban_list_embed())
 
 
 async def handle_user_strike(
@@ -809,7 +1038,7 @@ async def queue_worker():
                 t0 = time.time()
                 decision = await asyncio.wait_for(
                     asyncio.to_thread(run_moderator_reasoning, unique_id, user_name, comment),
-                    timeout=20.0,
+                    timeout=25.0,
                 )
                 llm_time = time.time() - t0
 
@@ -839,7 +1068,7 @@ async def queue_worker():
                     await speak_to_vbcable(reply, ensure_audio_ready)
 
         except asyncio.TimeoutError:
-            TermUI.log("WARN", "Respons LLM melewati batas waktu (20s), lanjut ke chat berikutnya.")
+            TermUI.log("WARN", "Respons LLM melewati batas waktu (25s), lanjut ke chat berikutnya.")
         except Exception as e:
             TermUI.log("ERROR", f"Worker error: {e}")
         finally:
@@ -877,8 +1106,34 @@ def extract_event_msg_id(event: CommentEvent) -> str | None:
     return None
 
 
+def apply_euler_sign_key() -> bool:
+    euler_key = os.getenv("EULERSTREAM_API_KEY", "").strip()
+    if not euler_key:
+        return False
+    if WebDefaults is not None:
+        WebDefaults.tiktok_sign_api_key = euler_key
+    return True
+
+
 def create_tiktok_client() -> TikTokLiveClient:
+    has_euler_key = apply_euler_sign_key()
     client = TikTokLiveClient(unique_id=tiktok_username)
+
+    cookies = get_resolved_tiktok_cookies()
+    idc_label = cookies.get("tt-target-idc", "alisg")
+
+    if should_authenticate_ws():
+        if hasattr(client.web, "set_session_id"):
+            client.web.set_session_id(cookies["sessionid"])
+        if hasattr(client.web, "cookies"):
+            for c_key, c_val in cookies.items():
+                client.web.cookies.set(c_key, c_val, domain=".tiktok.com")
+        session_label = f"Authenticated WS + Mod API | IDC: {idc_label}"
+    elif tiktok_session_id:
+        sign_tag = "EulerStream API Key" if has_euler_key else "EulerStream Public"
+        session_label = f"{sign_tag} WS + Authenticated Mod API | IDC: {idc_label}"
+    else:
+        session_label = "Public WS (Mod API Nonaktif)"
 
     @client.on(ConnectEvent)
     async def on_connect(event: ConnectEvent):
@@ -892,11 +1147,17 @@ def create_tiktok_client() -> TikTokLiveClient:
         ensure_worker_running()
         ensure_music_workers_running()
         broadcast_queue_update()
-        TermUI.log("TIKTOK", f"Terhubung ke Live @{event.unique_id} (filter riwayat chat aktif 1.0s)", TermUI.GREEN)
+        TermUI.log(
+            "TIKTOK",
+            f"Terhubung ke Live @{event.unique_id} ({session_label} | filter 1.0s)",
+            TermUI.GREEN,
+        )
 
         channel = await get_control_channel()
         if channel:
-            await channel.send(f"🟢 Terhubung ke TikTok Live **@{event.unique_id}**. AI Moderator siap bertugas.")
+            await channel.send(
+                f"🟢 Terhubung ke TikTok Live **@{event.unique_id}** (`{session_label}`). AI Moderator siap bertugas."
+            )
 
     @client.on(DisconnectEvent)
     async def on_disconnect(event: DisconnectEvent):
@@ -925,167 +1186,189 @@ def create_tiktok_client() -> TikTokLiveClient:
     @client.on(CommentEvent)
     async def on_comment(event: CommentEvent):
         global connected_at
-        now = time.time()
-        if connected_at is None:
-            connected_at = now
+        try:
+            now = time.time()
+            if connected_at is None:
+                connected_at = now
 
-        user_obj = getattr(event, "user", None) or getattr(event, "user_info", None)
-        text = str(getattr(event, "comment", "") or "").strip()
-        if not text:
-            return
+            user_obj = getattr(event, "user", None) or getattr(event, "user_info", None)
+            text = str(getattr(event, "comment", "") or "").strip()
+            if not text:
+                return
 
-        msg_ts = extract_comment_timestamp(event)
-        if msg_ts > 0 and msg_ts < (BOOT_TIME - 10.0):
-            return
+            msg_ts = extract_comment_timestamp(event)
+            if msg_ts > 0 and msg_ts < (BOOT_TIME - 10.0):
+                return
 
-        if (now - connected_at) < 1.0:
-            return
+            if (now - connected_at) < 1.0:
+                return
 
-        unique_id = get_user_unique_id(user_obj)
-        numeric_uid = get_user_numeric_id(user_obj)
-        display_name = get_clean_nickname(user_obj)
-        sec_uid = get_user_sec_uid(user_obj)
+            unique_id = get_user_unique_id(user_obj)
+            numeric_uid = get_user_numeric_id(user_obj)
+            display_name = get_clean_nickname(user_obj)
+            sec_uid = get_user_sec_uid(user_obj)
 
-        raw_msg_id = extract_event_msg_id(event)
-        dedup_key = f"id:{raw_msg_id}" if raw_msg_id else f"fb:{unique_id}:{text}:{int(now * 2)}"
-        if dedup_key in seen_comments:
-            return
-        seen_comments.add(dedup_key)
-        if len(seen_comments) > 800:
-            seen_comments.clear()
+            raw_msg_id = extract_event_msg_id(event)
+            dedup_key = f"id:{raw_msg_id}" if raw_msg_id else f"fb:{unique_id}:{text}:{int(now * 2)}"
+            if dedup_key in seen_comments:
+                return
+            seen_comments.add(dedup_key)
+            if len(seen_comments) > 800:
+                seen_comments.clear()
 
-        lower_text = text.lower()
+            lower_text = text.lower()
+            music_prefixes = ("!play ", "req ", "request ", "m!p ")
 
-        if is_host_account(unique_id, display_name):
-            TermUI.log("HOST", f"{display_name} (@{unique_id}): {text}", TermUI.YELLOW)
-            record_room_event_memory(f"[HOST {display_name}]: {text}")
-            if lower_text.startswith(("!play ", "req ", "m!p ")):
-                song_query = text.split(" ", 1)[1].strip()
-                if song_query:
-                    enqueue_song(f"Host ({display_name})", song_query)
-            return
+            if is_host_account(unique_id, display_name):
+                TermUI.log("HOST", f"{display_name} (@{unique_id}): {text}", TermUI.YELLOW)
+                record_room_event_memory(f"[HOST {display_name}]: {text}")
+                if lower_text.startswith(music_prefixes):
+                    parts = re.split(r"\s+", text, maxsplit=1)
+                    song_query = parts[1].strip() if len(parts) > 1 else ""
+                    if song_query:
+                        enqueue_song(f"Host ({display_name})", song_query)
+                return
 
-        register_viewer(user_obj, is_chat=True)
-        record_user_chat_turn(unique_id, display_name, text)
-        ensure_worker_running()
-        TermUI.log("CHAT", f"{display_name}: {text}")
+            register_viewer(user_obj, is_chat=True)
+            record_user_chat_turn(unique_id, display_name, text)
+            ensure_worker_running()
+            TermUI.log("CHAT", f"{display_name}: {text}")
 
-        if is_user_permanently_banned(unique_id, numeric_uid):
-            TermUI.log("WARN", f"Auto-Enforce Ban: {display_name} (@{unique_id}) mencoba komentar, kick ulang.")
-            asyncio.create_task(
-                execute_tiktok_moderation("kick", numeric_uid, unique_id, display_name, sec_uid, silent=True)
+            if is_user_permanently_banned(unique_id, numeric_uid):
+                TermUI.log("WARN", f"Auto-Enforce Ban: {user_name_safe(display_name, unique_id)} mencoba komentar, kick ulang.")
+                asyncio.create_task(
+                    execute_tiktok_moderation("kick", numeric_uid, unique_id, display_name, sec_uid, silent=True)
+                )
+                return
+
+            if lower_text.startswith(music_prefixes):
+                parts = re.split(r"\s+", text, maxsplit=1)
+                song_query = parts[1].strip() if len(parts) > 1 else ""
+                if not song_query:
+                    return
+
+                f_status, matched_bw = check_badword_violation(song_query)
+                if f_status == "VIOLATION":
+                    await handle_user_strike(numeric_uid, unique_id, display_name, text, matched_bw, sec_uid)
+                    return
+
+                if len(music_pending_items) >= 20:
+                    TermUI.log("WARN", f"Request {display_name} ditolak: antrean penuh ({len(music_pending_items)}).")
+                    return
+
+                last_user_req = user_music_cooldown.get(unique_id, 0.0)
+                if now - last_user_req < 5.0:
+                    return
+                user_music_cooldown[unique_id] = now
+
+                TermUI.log("MUSIC", f"Request masuk dari {display_name}: {song_query}", TermUI.CYAN)
+                enqueue_song(display_name, song_query)
+                pos_now = len(music_pending_items)
+                if pos_now <= 1 and music_state["current"] is None:
+                    ack_msg = f"Oke Kak {display_name}, lagu {song_query} langsung disiapkan ya."
+                else:
+                    ack_msg = f"Oke Kak {display_name}, lagu {song_query} masuk antrean nomor {pos_now} ya."
+                enqueue_action(PRIORITY_SOCIAL, "HOST_SPEAK", (ack_msg,))
+                return
+
+            latest_comment_token["id"] += 1
+            enqueue_action(
+                PRIORITY_COMMENT,
+                "COMMENT",
+                (latest_comment_token["id"], numeric_uid, unique_id, display_name, text, sec_uid, now),
             )
-            return
-
-        if lower_text.startswith(("!play ", "req ", "m!p ")):
-            song_query = text.split(" ", 1)[1].strip()
-            if not song_query:
-                return
-
-            f_status, matched_bw = check_badword_violation(song_query)
-            if f_status == "VIOLATION":
-                await handle_user_strike(numeric_uid, unique_id, display_name, text, matched_bw, sec_uid)
-                return
-
-            if len(music_pending_items) >= 20:
-                TermUI.log("WARN", f"Request {display_name} ditolak: antrean penuh ({len(music_pending_items)}).")
-                return
-
-            last_user_req = user_music_cooldown.get(unique_id, 0.0)
-            if now - last_user_req < 5.0:
-                return
-            user_music_cooldown[unique_id] = now
-
-            TermUI.log("MUSIC", f"Request masuk dari {display_name}: {song_query}", TermUI.CYAN)
-            enqueue_song(display_name, song_query)
-            pos_now = len(music_pending_items)
-            if pos_now <= 1 and music_state["current"] is None:
-                ack_msg = f"Oke Kak {display_name}, lagu {song_query} langsung disiapkan ya."
-            else:
-                ack_msg = f"Oke Kak {display_name}, lagu {song_query} masuk antrean nomor {pos_now} dan langsung di-download di belakang layar ya."
-            enqueue_action(PRIORITY_SOCIAL, "HOST_SPEAK", (ack_msg,))
-            return
-
-        latest_comment_token["id"] += 1
-        enqueue_action(
-            PRIORITY_COMMENT,
-            "COMMENT",
-            (latest_comment_token["id"], numeric_uid, unique_id, display_name, text, sec_uid, now),
-        )
+        except Exception as e:
+            TermUI.log("ERROR", f"Gagal memproses CommentEvent: {type(e).__name__}: {e}", TermUI.RED)
 
     @client.on(GiftEvent)
     async def on_gift(event: GiftEvent):
-        user_obj = getattr(event, "user", None) or getattr(event, "user_info", None)
-        gift_obj = getattr(event, "gift", None)
-        streakable = getattr(gift_obj, "streakable", False)
-        repeat_end = getattr(event, "repeat_end", True)
-        if streakable and not repeat_end:
-            return
+        try:
+            user_obj = getattr(event, "user", None) or getattr(event, "user_info", None)
+            gift_obj = getattr(event, "gift", None)
+            streakable = getattr(gift_obj, "streakable", False)
+            repeat_end = getattr(event, "repeat_end", True)
+            if streakable and not repeat_end:
+                return
 
-        display_name = get_clean_nickname(user_obj)
-        gift_name = (
-            getattr(gift_obj, "name", None)
-            or getattr(getattr(gift_obj, "info", None), "name", None)
-            or "Gift"
-        )
-        count = getattr(event, "repeat_count", 1) or 1
+            display_name = get_clean_nickname(user_obj)
+            gift_name = (
+                getattr(gift_obj, "name", None)
+                or getattr(getattr(gift_obj, "info", None), "name", None)
+                or "Gift"
+            )
+            count = getattr(event, "repeat_count", 1) or 1
 
-        record_viewer_gift(user_obj, gift_name, count)
-        broadcast_queue_update()
+            record_viewer_gift(user_obj, gift_name, count)
+            broadcast_queue_update()
 
-        ensure_worker_running()
-        TermUI.log("TIKTOK", f"Gift: {display_name} mengirim {count}x {gift_name}", TermUI.YELLOW)
-        enqueue_action(PRIORITY_GIFT, "GIFT", (display_name, gift_name, count))
+            ensure_worker_running()
+            TermUI.log("TIKTOK", f"Gift: {display_name} mengirim {count}x {gift_name}", TermUI.YELLOW)
+            enqueue_action(PRIORITY_GIFT, "GIFT", (display_name, gift_name, count))
 
-        channel = await get_control_channel()
-        if channel:
-            await channel.send(f"🎁 **Gift Masuk:** `{display_name}` mengirim **{count}x {gift_name}**")
+            channel = await get_control_channel()
+            if channel:
+                await channel.send(f"🎁 **Gift Masuk:** `{display_name}` mengirim **{count}x {gift_name}**")
+        except Exception as e:
+            TermUI.log("ERROR", f"Gagal memproses GiftEvent: {type(e).__name__}: {e}", TermUI.RED)
 
     @client.on(FollowEvent)
     async def on_follow(event: FollowEvent):
-        user_obj = getattr(event, "user", None) or getattr(event, "user_info", None)
-        register_viewer(user_obj, is_chat=False)
-        unique_id = get_user_unique_id(user_obj)
-        if unique_id in followed_users or is_host_account(unique_id):
-            return
-        followed_users.add(unique_id)
+        try:
+            user_obj = getattr(event, "user", None) or getattr(event, "user_info", None)
+            register_viewer(user_obj, is_chat=False)
+            unique_id = get_user_unique_id(user_obj)
+            if unique_id in followed_users or is_host_account(unique_id):
+                return
+            followed_users.add(unique_id)
 
-        display_name = get_clean_nickname(user_obj)
-        ensure_worker_running()
-        enqueue_action(PRIORITY_SOCIAL, "FOLLOW", (display_name,))
+            display_name = get_clean_nickname(user_obj)
+            ensure_worker_running()
+            enqueue_action(PRIORITY_SOCIAL, "FOLLOW", (display_name,))
+        except Exception as e:
+            TermUI.log("ERROR", f"Gagal memproses FollowEvent: {type(e).__name__}: {e}", TermUI.RED)
 
     @client.on(ShareEvent)
     async def on_share(event: ShareEvent):
-        user_obj = getattr(event, "user", None) or getattr(event, "user_info", None)
-        register_viewer(user_obj, is_chat=False)
-        now = time.time()
-        unique_id = get_user_unique_id(user_obj)
-        if is_host_account(unique_id) or now - shared_users_cooldown.get(unique_id, 0) < 60.0:
-            return
-        shared_users_cooldown[unique_id] = now
+        try:
+            user_obj = getattr(event, "user", None) or getattr(event, "user_info", None)
+            register_viewer(user_obj, is_chat=False)
+            now = time.time()
+            unique_id = get_user_unique_id(user_obj)
+            if is_host_account(unique_id) or now - shared_users_cooldown.get(unique_id, 0) < 60.0:
+                return
+            shared_users_cooldown[unique_id] = now
 
-        display_name = get_clean_nickname(user_obj)
-        ensure_worker_running()
-        enqueue_action(PRIORITY_SOCIAL, "SHARE", (display_name,))
+            display_name = get_clean_nickname(user_obj)
+            ensure_worker_running()
+            enqueue_action(PRIORITY_SOCIAL, "SHARE", (display_name,))
+        except Exception as e:
+            TermUI.log("ERROR", f"Gagal memproses ShareEvent: {type(e).__name__}: {e}", TermUI.RED)
 
     @client.on(LikeEvent)
     async def on_like(event: LikeEvent):
-        user_obj = getattr(event, "user", None) or getattr(event, "user_info", None)
-        like_delta = int(getattr(event, "count", 1) or 1)
-        room_total = int(getattr(event, "total", 0) or 0)
-        record_viewer_like(user_obj, like_delta, room_total)
-        broadcast_queue_update()
+        try:
+            user_obj = getattr(event, "user", None) or getattr(event, "user_info", None)
+            like_delta = int(getattr(event, "count", 1) or 1)
+            room_total = int(getattr(event, "total", 0) or 0)
+            record_viewer_like(user_obj, like_delta, room_total)
+            broadcast_queue_update()
 
-        now = time.time()
-        if now - state["last_like_shoutout"] < 25.0:
-            return
-        state["last_like_shoutout"] = now
+            now = time.time()
+            if now - state["last_like_shoutout"] < 25.0:
+                return
+            state["last_like_shoutout"] = now
 
-        display_name = get_clean_nickname(user_obj)
-        ensure_worker_running()
-        enqueue_action(PRIORITY_SOCIAL, "LIKE", (display_name,))
+            display_name = get_clean_nickname(user_obj)
+            ensure_worker_running()
+            enqueue_action(PRIORITY_SOCIAL, "LIKE", (display_name,))
+        except Exception as e:
+            TermUI.log("ERROR", f"Gagal memproses LikeEvent: {type(e).__name__}: {e}", TermUI.RED)
 
     return client
+
+
+def user_name_safe(display_name: str, unique_id: str) -> str:
+    return f"{display_name} (@{unique_id})"
 
 
 tiktok_client = create_tiktok_client()
@@ -1100,7 +1383,8 @@ async def start_tiktok_background():
                 return
 
             tiktok_disconnected_event.clear()
-            TermUI.log("TIKTOK", f"Menghubungkan ke server TikTok Live (@{tiktok_username})...")
+            mode_tag = "Authenticated WS" if should_authenticate_ws() else "EulerSign WS + Auth Mod API"
+            TermUI.log("TIKTOK", f"Menghubungkan ke TikTok Live (@{tiktok_username}) [{mode_tag}]...")
             start_res = await tiktok_client.start()
 
             for _ in range(30):
@@ -1130,6 +1414,8 @@ async def start_tiktok_background():
             delay = state.get("reconnect_delay", 5)
             if "11001" in err_str or "getaddrinfo" in err_str:
                 TermUI.log("ERROR", f"DNS gagal resolve server TikTok (cek koneksi/DNS 1.1.1.1). Mencoba ulang dalam {delay}s...")
+            elif "503" in err_str or "SIGN_NOT_200" in err_str:
+                TermUI.log("ERROR", f"Sign API mengembalikan 503 (pastikan TIKTOK_WS_AUTH=auto). Ulang dalam {delay}s...")
             else:
                 TermUI.log("ERROR", f"Koneksi TikTok Live terhenti: {e}. Mencoba ulang dalam {delay}s...")
 
@@ -1163,6 +1449,9 @@ def restart_tiktok_background():
 
 
 class ModeratorDiscordBot(discord.Client):
+    async def setup_hook(self):
+        self.add_view(ControlPanelView())
+
     async def close(self):
         TermUI.log("SYSTEM", "Menutup terminal & menyimpan database viewer...")
         save_viewers_db()
@@ -1201,6 +1490,56 @@ class ModeratorDiscordBot(discord.Client):
 intents = discord.Intents.default()
 intents.message_content = True
 discord_client = ModeratorDiscordBot(intents=intents)
+
+
+@discord_client.event
+async def on_interaction(interaction: discord.Interaction):
+    if interaction.type != discord.InteractionType.component:
+        return
+    await asyncio.sleep(0.05)
+    if interaction.response.is_done():
+        return
+
+    custom_id = (interaction.data or {}).get("custom_id", "")
+    if not custom_id.startswith("vmod:"):
+        return
+
+    await interaction.response.defer()
+    if interaction.channel_id != control_channel_id:
+        return
+
+    parts = custom_id.split(":", 3)
+    if len(parts) < 4:
+        return
+
+    _, action, num_uid_str, unique_id = parts
+    numeric_uid = int(num_uid_str) if num_uid_str.isdigit() else 0
+    target = resolve_target_viewer(unique_id)
+    display_name = target["name"] if target else unique_id
+    sec_uid = target.get("sec_uid", "") if target else ""
+    if not numeric_uid and target:
+        numeric_uid = target["numeric_uid"]
+
+    if action == "skip":
+        last_escalated_question["question"] = None
+        await interaction.followup.send("⏭️ Eskalasi dilewati.", ephemeral=True)
+    elif action == "reset":
+        removed = user_warnings.pop(unique_id, None)
+        msg = (
+            f"🧹 Catatan peringatan untuk **{display_name}** (`@{unique_id}`) telah dihapus."
+            if removed else f"Tidak ada catatan strike aktif untuk `@{unique_id}`."
+        )
+        await interaction.followup.send(msg)
+    elif action in ("mute", "kick", "ban"):
+        label_map = {"mute": "MUTE 5 MENIT", "kick": "KICK", "ban": "PERMANENT BAN"}
+        enqueue_action(
+            PRIORITY_HOST,
+            "MANUAL_MOD",
+            (action, numeric_uid, unique_id, display_name, sec_uid),
+        )
+        await interaction.followup.send(
+            f"⚡ Eksekusi **{label_map[action]}** dikirim untuk **{display_name}** (`@{unique_id}`)."
+        )
 
 
 @discord_client.event

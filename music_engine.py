@@ -5,6 +5,7 @@ import random
 import shutil
 import asyncio
 import tempfile
+import threading
 import subprocess
 from typing import Callable, Awaitable
 import pygame
@@ -31,6 +32,7 @@ from ai_moderator import generate_autoplay_next_song
 _music_worker_task = None
 _prefetch_worker_task = None
 _notify_discord_fn: Callable[[str], Awaitable[None]] | None = None
+_download_lock = threading.Lock()
 
 
 def set_music_discord_notifier(fn: Callable[[str], Awaitable[None]]):
@@ -119,10 +121,15 @@ def find_ffmpeg_executable() -> str:
     )
 
 
-def prepare_song_wav(song_item: dict) -> tuple[str, int, str]:
+def prepare_song_wav(song_item: dict, deadline_ts: float | None = None) -> tuple[str, int, str]:
     ffmpeg_bin = find_ffmpeg_executable()
     song_query = song_item["query"]
     target_input = song_item.get("webpage_url") or song_query
+    hard_deadline = deadline_ts or (time.time() + 58.0)
+
+    def _progress_hook(d: dict):
+        if music_state.get("stop_flag") or time.time() > hard_deadline:
+            raise yt_dlp.utils.DownloadCancelled("Batas waktu unduhan lagu tercapai atau dihentikan.")
 
     tmp_dir = tempfile.gettempdir()
     uid_tag = f"{int(time.time() * 1000)}_{random.randint(1000, 9999)}"
@@ -130,60 +137,73 @@ def prepare_song_wav(song_item: dict) -> tuple[str, int, str]:
     wav_path = os.path.join(tmp_dir, f"mina_bgm_{uid_tag}.wav")
 
     ydl_opts = {
-        "format": "bestaudio[ext=m4a]/bestaudio/best",
+        "format": "bestaudio[ext=m4a][abr<=160]/bestaudio[abr<=160]/bestaudio[ext=m4a]/bestaudio/best",
         "outtmpl": raw_template,
         "noplaylist": True,
         "quiet": True,
         "no_warnings": True,
+        "noprogress": True,
         "default_search": "ytsearch1",
         "socket_timeout": 15,
-        "retries": 3,
-        "fragment_retries": 3,
-        "http_chunk_size": 1048576,
+        "retries": 2,
+        "fragment_retries": 2,
+        "http_chunk_size": 2097152,
+        "progress_hooks": [_progress_hook],
     }
 
-    downloaded_path = None
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(target_input, download=True)
-            if "entries" in info and info["entries"]:
-                info = info["entries"][0]
-            title = info.get("title") or song_item.get("title") or song_query
-            raw_dur = int(info.get("duration") or song_item.get("duration") or 210)
-            duration = min(420, max(15, raw_dur))
-            downloaded_path = ydl.prepare_filename(info)
+    with _download_lock:
+        if music_state.get("stop_flag") or time.time() > hard_deadline:
+            raise TimeoutError("Antrean unduhan melewati batas waktu.")
 
-        if not downloaded_path or not os.path.exists(downloaded_path):
+        downloaded_path = None
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(target_input, download=True)
+                if "entries" in info and info["entries"]:
+                    info = info["entries"][0]
+                title = info.get("title") or song_item.get("title") or song_query
+                raw_dur = int(info.get("duration") or song_item.get("duration") or 210)
+                duration = min(420, max(15, raw_dur))
+                downloaded_path = ydl.prepare_filename(info)
+
+            if not downloaded_path or not os.path.exists(downloaded_path):
+                prefix = f"mina_raw_{uid_tag}."
+                for fname in os.listdir(tmp_dir):
+                    if fname.startswith(prefix):
+                        downloaded_path = os.path.join(tmp_dir, fname)
+                        break
+
+            if not downloaded_path or not os.path.exists(downloaded_path):
+                raise FileNotFoundError("File audio mentah gagal diunduh oleh yt-dlp.")
+
+            cmd = [
+                ffmpeg_bin,
+                "-y",
+                "-i",
+                downloaded_path,
+                "-t",
+                "420",
+                "-ar",
+                "44100",
+                "-ac",
+                "2",
+                "-f",
+                "wav",
+                wav_path,
+            ]
+            subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True, timeout=25)
+            return title, duration, wav_path
+        finally:
+            if downloaded_path and os.path.exists(downloaded_path):
+                try:
+                    os.remove(downloaded_path)
+                except Exception:
+                    pass
             prefix = f"mina_raw_{uid_tag}."
-            for fname in os.listdir(tmp_dir):
-                if fname.startswith(prefix):
-                    downloaded_path = os.path.join(tmp_dir, fname)
-                    break
-
-        if not downloaded_path or not os.path.exists(downloaded_path):
-            raise FileNotFoundError("File audio mentah gagal diunduh oleh yt-dlp.")
-
-        cmd = [
-            ffmpeg_bin,
-            "-y",
-            "-i",
-            downloaded_path,
-            "-t",
-            "420",
-            "-ar",
-            "44100",
-            "-ac",
-            "2",
-            "-f",
-            "wav",
-            wav_path,
-        ]
-        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True, timeout=25)
-        return title, duration, wav_path
-    finally:
-        if downloaded_path and os.path.exists(downloaded_path):
             try:
-                os.remove(downloaded_path)
+                for fname in os.listdir(tmp_dir):
+                    if fname.startswith(prefix):
+                        os.remove(os.path.join(tmp_dir, fname))
             except Exception:
                 pass
 
@@ -285,9 +305,10 @@ async def music_prefetch_worker():
                 broadcast_queue_update()
                 TermUI.log("MUSIC", f"Pre-download antrean: {item['query']} (Req: {item['requester']})...")
                 try:
+                    deadline = time.time() + 58.0
                     title, duration, wav_path = await asyncio.wait_for(
-                        asyncio.to_thread(prepare_song_wav, item),
-                        timeout=35.0,
+                        asyncio.to_thread(prepare_song_wav, item, deadline),
+                        timeout=65.0,
                     )
                     if item not in music_pending_items:
                         remove_wav_file(wav_path)
@@ -298,9 +319,10 @@ async def music_prefetch_worker():
                     item["status"] = "ready"
                     TermUI.log("MUSIC", f"Siap putar (Pre-fetched): {title}", TermUI.CYAN)
                 except Exception as e:
+                    err_txt = str(e) or type(e).__name__
                     item["status"] = "failed"
-                    item["error"] = str(e)
-                    TermUI.log("WARN", f"Pre-download gagal ({item['query']}): {e}")
+                    item["error"] = err_txt
+                    TermUI.log("WARN", f"Pre-download gagal ({item['query']}): {err_txt}")
                 finally:
                     ev = item.get("ready_event")
                     if isinstance(ev, asyncio.Event):
@@ -316,7 +338,7 @@ async def music_prefetch_worker():
             and music_state["last_seed_query"]
             and music_state["current_item"] is not None
             and music_state.get("autoplay_prefetched") is None
-            and (time.time() - music_state["started_at"]) >= 8.0
+            and (time.time() - music_state["started_at"]) >= 10.0
         ):
             did_work = True
             seed_now = music_state["last_seed_query"]
@@ -329,7 +351,7 @@ async def music_prefetch_worker():
                         last_now,
                         list(played_music_history),
                     ),
-                    timeout=15.0,
+                    timeout=12.0,
                 )
                 if not music_pending_items and music_state["autoplay"] and not music_state["stop_flag"]:
                     ap_item = {
@@ -343,9 +365,10 @@ async def music_prefetch_worker():
                         "wav_path": None,
                         "ready_event": asyncio.Event(),
                     }
+                    deadline = time.time() + 58.0
                     title, duration, wav_path = await asyncio.wait_for(
-                        asyncio.to_thread(prepare_song_wav, ap_item),
-                        timeout=35.0,
+                        asyncio.to_thread(prepare_song_wav, ap_item, deadline),
+                        timeout=65.0,
                     )
                     if music_state["stop_flag"] or not music_state["autoplay"]:
                         remove_wav_file(wav_path)
@@ -358,7 +381,7 @@ async def music_prefetch_worker():
                         music_state["autoplay_prefetched"] = ap_item
                         TermUI.log("MUSIC", f"Autoplay berikutnya sudah siap: {title}", TermUI.CYAN)
             except Exception:
-                pass
+                await asyncio.sleep(4.0)
 
         if not did_work:
             music_prefetch_event.clear()
@@ -371,12 +394,15 @@ async def music_prefetch_worker():
 async def music_player_worker():
     TermUI.log("MUSIC", "Pemutar musik latar VB-Cable + Pre-Fetch Queue & Autoplay aktif.")
     broadcast_queue_update()
+    autoplay_fail_streak = 0
+
     while True:
         is_autoplay_track = False
         song_item = None
 
         if music_pending_items:
             music_state["stop_flag"] = False
+            autoplay_fail_streak = 0
             song_item = music_pending_items.pop(0)
             if not music_pending_items:
                 music_queue_event.clear()
@@ -393,6 +419,11 @@ async def music_player_worker():
                     or music_state["stop_flag"]
                     or not music_state["last_seed_query"]
                 ):
+                    continue
+
+                if autoplay_fail_streak >= 3:
+                    await asyncio.sleep(15.0)
+                    autoplay_fail_streak = 0
                     continue
 
                 prefetched_ap = music_state.get("autoplay_prefetched")
@@ -413,7 +444,7 @@ async def music_player_worker():
                                 last_now,
                                 list(played_music_history),
                             ),
-                            timeout=15.0,
+                            timeout=12.0,
                         )
                     except asyncio.TimeoutError:
                         next_song = f"{seed_now} official audio"
@@ -446,7 +477,7 @@ async def music_player_worker():
             if song_item.get("status") == "downloading":
                 ev = song_item.get("ready_event")
                 if isinstance(ev, asyncio.Event):
-                    await asyncio.wait_for(ev.wait(), timeout=36.0)
+                    await asyncio.wait_for(ev.wait(), timeout=66.0)
 
             if song_item.get("status") == "ready" and song_item.get("wav_path") and os.path.exists(song_item["wav_path"]):
                 title = song_item["title"]
@@ -456,9 +487,10 @@ async def music_player_worker():
                 raise RuntimeError(song_item.get("error") or "Gagal mengunduh lagu")
             else:
                 TermUI.log("MUSIC", f"Memuat audio: {song_query} (Req: {requester_name})...")
+                deadline = time.time() + 58.0
                 title, duration, wav_path = await asyncio.wait_for(
-                    asyncio.to_thread(prepare_song_wav, song_item),
-                    timeout=35.0,
+                    asyncio.to_thread(prepare_song_wav, song_item, deadline),
+                    timeout=65.0,
                 )
 
             if music_state["stop_flag"]:
@@ -466,6 +498,7 @@ async def music_player_worker():
                 remove_wav_file(wav_path)
                 continue
 
+            autoplay_fail_streak = 0
             ensure_audio_ready()
             song_item["title"] = title
             song_item["duration"] = duration
@@ -518,11 +551,15 @@ async def music_player_worker():
                 await asyncio.sleep(0.2)
 
         except Exception as e:
-            TermUI.log("ERROR", f"Gagal memutar '{song_query}': {e}")
+            err_detail = str(e) or type(e).__name__
+            TermUI.log("ERROR", f"Gagal memutar '{song_query}': {err_detail}")
             played_music_history.append(song_query)
-            if not is_autoplay_track:
-                await _notify_discord(f"⚠️ Gagal memuat lagu `{song_query}`: `{e}`")
-            await asyncio.sleep(0.8)
+            if is_autoplay_track:
+                autoplay_fail_streak += 1
+                await asyncio.sleep(min(30.0, 5.0 * autoplay_fail_streak))
+            else:
+                await _notify_discord(f"⚠️ Gagal memuat lagu `{song_query}`: `{err_detail}`")
+                await asyncio.sleep(1.0)
         finally:
             music_state["current"] = None
             music_state["current_item"] = None

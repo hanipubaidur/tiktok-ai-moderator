@@ -1,3 +1,4 @@
+import os
 import io
 import re
 import json
@@ -36,14 +37,27 @@ from storage import (
     add_viewer_memory_note,
 )
 
-gemini_client = (
-    genai.Client(
-        api_key=gemini_key,
-        http_options=types.HttpOptions(timeout=12000),
-    )
-    if gemini_key
-    else None
-)
+GEMINI_MODELS = ["gemini-3.5-flash-lite"]
+
+_openrouter_free_cache: dict = {
+    "models": [],
+    "fetched_at": 0.0,
+}
+
+
+def _build_gemini_clients() -> list[genai.Client]:
+    raw_multi = os.getenv("GEMINI_API_KEYS", "").strip() or (gemini_key or "").strip()
+    keys = [k.strip() for k in raw_multi.split(",") if k.strip()]
+    return [
+        genai.Client(
+            api_key=k,
+            http_options=types.HttpOptions(timeout=20000),
+        )
+        for k in dict.fromkeys(keys)
+    ]
+
+
+gemini_clients = _build_gemini_clients()
 
 openrouter_client = (
     OpenAI(
@@ -65,13 +79,81 @@ def _strip_reasoning_tags(text: str) -> str:
     return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
 
 
+def _sanitize_plain_reply(text: str, max_sentences: int = 2) -> str:
+    cleaned = _strip_reasoning_tags(text)
+    cleaned = re.sub(r"[*`#_~>]+", "", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    parts = [p.strip() for p in re.split(r"(?<=[.!?])\s+", cleaned) if p.strip()]
+    shortened = " ".join(parts[:max_sentences]).strip()
+    if len(shortened) > 220:
+        shortened = shortened[:217].rsplit(" ", 1)[0] + "."
+    return shortened
+
+
+def _is_valid_song_candidate(text: str) -> bool:
+    if not text:
+        return False
+    low = text.lower()
+    blocked_phrases = (
+        "halo!",
+        "halo,",
+        "saya adalah",
+        "unlimitedai",
+        "membantu anda",
+        "sebagai ai",
+        "rekomendasi lagu",
+        "berikut adalah",
+        "tentu,",
+        "maaf,",
+        "apikey",
+        "invalid",
+    )
+    if any(b in low for b in blocked_phrases):
+        return False
+    if len(text) < 4 or len(text) > 75 or len(text.split()) > 10:
+        return False
+    return True
+
+
+def _get_live_openrouter_free_models() -> list[str]:
+    now = time.time()
+    if _openrouter_free_cache["models"] and (now - _openrouter_free_cache["fetched_at"]) < 1800:
+        return _openrouter_free_cache["models"]
+
+    discovered = []
+    try:
+        with httpx.Client(timeout=6.0) as http:
+            resp = http.get("https://openrouter.ai/api/v1/models")
+            if resp.status_code == 200:
+                items = resp.json().get("data", [])
+                for item in items:
+                    mid = str(item.get("id") or "")
+                    pricing = item.get("pricing") or {}
+                    is_zero_price = (
+                        str(pricing.get("prompt", "1")) == "0"
+                        and str(pricing.get("completion", "1")) == "0"
+                    )
+                    if (mid.endswith(":free") or is_zero_price) and mid != "openrouter/free":
+                        discovered.append(mid)
+    except Exception:
+        pass
+
+    preferred_keywords = ("gemini", "llama", "qwen", "deepseek", "gemma", "mistral")
+    discovered.sort(
+        key=lambda m: next((i for i, kw in enumerate(preferred_keywords) if kw in m.lower()), 99)
+    )
+    final_list = discovered[:6] + ["openrouter/free"]
+    _openrouter_free_cache["models"] = final_list
+    _openrouter_free_cache["fetched_at"] = now
+    return final_list
+
+
 def _call_openrouter(
     models: list[str],
     system_prompt: str,
     user_prompt: str,
-    json_mode: bool = False,
     temperature: float = 0.65,
-    max_tokens: int = 1024,
+    max_tokens: int = 1500,
 ) -> str:
     if not openrouter_client or is_llm_on_cooldown("openrouter"):
         raise RuntimeError("OpenRouter tidak aktif atau sedang cooldown")
@@ -81,35 +163,39 @@ def _call_openrouter(
         messages.append({"role": "system", "content": system_prompt})
     messages.append({"role": "user", "content": user_prompt})
 
+    effective_max_tokens = max(max_tokens, 1500)
+
     for model_name in models:
         cd_key = f"openrouter:{model_name}"
         if is_llm_on_cooldown(cd_key):
             continue
         try:
-            kwargs = {
-                "model": model_name,
-                "messages": messages,
-                "temperature": temperature,
-                "max_tokens": max_tokens,
-                "timeout": 12.0,
-            }
-            if json_mode:
-                kwargs["response_format"] = {"type": "json_object"}
-
-            try:
-                res = openrouter_client.chat.completions.create(**kwargs)
-            except Exception as inner_e:
-                if json_mode and "response_format" in str(inner_e).lower():
-                    kwargs.pop("response_format", None)
-                    res = openrouter_client.chat.completions.create(**kwargs)
-                else:
-                    raise
+            res = openrouter_client.chat.completions.create(
+                model=model_name,
+                messages=messages,
+                temperature=temperature,
+                max_tokens=effective_max_tokens,
+                timeout=10.0,
+            )
 
             choices = getattr(res, "choices", None)
             if not choices:
                 raise ValueError(f"{model_name} choices kosong")
 
-            raw_content = _strip_reasoning_tags(getattr(choices[0].message, "content", None) or "")
+            msg_obj = choices[0].message
+            raw_content = _strip_reasoning_tags(getattr(msg_obj, "content", None) or "")
+
+            if not raw_content:
+                reasoning_alt = (
+                    getattr(msg_obj, "reasoning", None)
+                    or getattr(msg_obj, "reasoning_content", None)
+                    or ""
+                )
+                if reasoning_alt:
+                    m_json = re.search(r"\{[^{}]*\"action\"[^{}]*\}", reasoning_alt, flags=re.DOTALL)
+                    if m_json:
+                        raw_content = m_json.group(0)
+
             if not raw_content:
                 raise ValueError(f"{model_name} konten kosong")
 
@@ -125,24 +211,26 @@ def _call_openrouter(
     raise RuntimeError("Semua model OpenRouter gagal")
 
 
-def _call_betabotz_api(system_prompt: str, user_prompt: str) -> str:
+def _call_betabotz_api(system_prompt: str, user_prompt: str, music_mode: bool = False) -> str:
     if not betabotz_key or is_llm_on_cooldown("betabotz"):
         raise RuntimeError("BetaBotz tidak aktif atau sedang cooldown")
 
     base_url = "https://api.betabotz.eu.org/api/search"
-    messages = []
-    if system_prompt:
-        messages.append({"role": "system", "content": system_prompt})
-    messages.append({"role": "user", "content": user_prompt})
+    compact_logic = (system_prompt or "Kamu adalah Mina, AI Co-Host TikTok Live. Jawab singkat maksimal 2 kalimat tanpa markdown.")[:1200]
 
     def extract_text(payload) -> str:
         if isinstance(payload, dict):
-            for key_name in ("result", "message", "data", "answer", "response"):
+            for key_name in ("result", "message", "data", "answer", "response", "content"):
                 val = payload.get(key_name)
                 if isinstance(val, str) and val.strip():
                     return _strip_reasoning_tags(val)
                 if isinstance(val, dict):
-                    nested = val.get("result") or val.get("message") or val.get("text")
+                    nested = (
+                        val.get("result")
+                        or val.get("message")
+                        or val.get("text")
+                        or val.get("content")
+                    )
                     if isinstance(nested, str) and nested.strip():
                         return _strip_reasoning_tags(nested)
         elif isinstance(payload, str):
@@ -151,19 +239,13 @@ def _call_betabotz_api(system_prompt: str, user_prompt: str) -> str:
 
     attempts = [
         (
-            "openai-custom (POST)",
-            "POST",
-            f"{base_url}/openai-custom",
-            {"json": {"apikey": betabotz_key, "message": messages}},
-        ),
-        (
             "openai-logic (POST)",
             "POST",
             f"{base_url}/openai-logic",
             {
                 "json": {
                     "apikey": betabotz_key,
-                    "logic": system_prompt or "Kamu adalah Mina, AI Co-Host & Moderator TikTok Live.",
+                    "logic": compact_logic,
                     "text": user_prompt,
                 }
             },
@@ -175,14 +257,14 @@ def _call_betabotz_api(system_prompt: str, user_prompt: str) -> str:
             {
                 "params": {
                     "apikey": betabotz_key,
-                    "logic": (system_prompt or "")[:1200],
-                    "text": user_prompt,
+                    "logic": compact_logic[:750],
+                    "text": user_prompt[:450],
                 }
             },
         ),
     ]
 
-    with httpx.Client(timeout=12.0, follow_redirects=True) as http:
+    with httpx.Client(timeout=8.0, follow_redirects=True) as http:
         for ep_name, method, ep_url, req_kwargs in attempts:
             try:
                 resp = http.request(method, ep_url, **req_kwargs)
@@ -191,6 +273,15 @@ def _call_betabotz_api(system_prompt: str, user_prompt: str) -> str:
 
                 if not raw_text or ("apikey" in raw_text.lower() and "invalid" in raw_text.lower()):
                     raise ValueError(f"BetaBotz ({ep_name}) respons tidak valid/kosong")
+
+                if "unlimitedai.chat" in raw_text.lower():
+                    raise ValueError(f"BetaBotz ({ep_name}) mengembalikan teks default bot")
+
+                if music_mode:
+                    first_line = raw_text.splitlines()[0].strip('"\'*-.0123456789 ')
+                    if not _is_valid_song_candidate(first_line):
+                        raise ValueError(f"BetaBotz ({ep_name}) bukan judul lagu valid")
+                    raw_text = first_line
 
                 state["last_llm_used"] = f"BetaBotz ({ep_name})"
                 return raw_text
@@ -208,58 +299,71 @@ def call_llm_cascade(
     temperature: float = 0.65,
     max_tokens: int = 1024,
 ) -> str:
-    if gemini_client:
+    # 1. Utama untuk menyapa & moderasi chat: Gemini 3.5 Flash Lite
+    if gemini_clients:
         combined_prompt = f"{system_prompt}\n\n{user_prompt}" if system_prompt else user_prompt
-        for model_name in ["gemini-3.5-flash-lite", "gemini-3.8-flash"]:
-            cd_key = f"gemini:{model_name}"
-            if is_llm_on_cooldown(cd_key):
-                continue
-            try:
-                cfg_kwargs = {
-                    "temperature": temperature,
-                    "max_output_tokens": max_tokens,
-                    "http_options": types.HttpOptions(timeout=12000),
-                }
-                if json_mode:
-                    cfg_kwargs["response_mime_type"] = "application/json"
+        for model_name in GEMINI_MODELS:
+            for key_idx, client in enumerate(gemini_clients, start=1):
+                cd_key = f"gemini:k{key_idx}:{model_name}"
+                if is_llm_on_cooldown(cd_key):
+                    continue
 
-                res = gemini_client.models.generate_content(
-                    model=model_name,
-                    contents=combined_prompt,
-                    config=types.GenerateContentConfig(**cfg_kwargs),
-                )
-                raw_content = _strip_reasoning_tags(res.text or "")
-                if not raw_content:
-                    raise ValueError(f"{model_name} konten kosong")
-                state["last_llm_used"] = f"Gemini ({model_name})"
-                return raw_content
-            except Exception as e:
-                set_llm_cooldown(cd_key, e, f"Gemini ({model_name})")
+                key_tag = f"Key#{key_idx} " if len(gemini_clients) > 1 else ""
+                for attempt in range(2):
+                    try:
+                        cfg_kwargs = {
+                            "temperature": temperature,
+                            "max_output_tokens": max_tokens,
+                        }
+                        if json_mode:
+                            cfg_kwargs["response_mime_type"] = "application/json"
 
+                        res = client.models.generate_content(
+                            model=model_name,
+                            contents=combined_prompt,
+                            config=types.GenerateContentConfig(**cfg_kwargs),
+                        )
+                        raw_content = _strip_reasoning_tags(res.text or "")
+                        if not raw_content:
+                            raise ValueError(f"{model_name} konten kosong")
+                        state["last_llm_used"] = f"Gemini {key_tag}({model_name})"
+                        return raw_content
+                    except Exception as e:
+                        err_lower = str(e).lower()
+                        is_quota = "429" in err_lower or "resource_exhausted" in err_lower
+                        is_transient = any(
+                            k in err_lower
+                            for k in ("503", "unavailable", "disconnected", "timeout", "reset")
+                        )
+                        if attempt == 0 and is_transient and not is_quota:
+                            time.sleep(0.4)
+                            continue
+                        set_llm_cooldown(cd_key, e, f"Gemini {key_tag}({model_name})")
+                        break
+
+    # 2. Cadangan pertama jika Gemini 3.5 limit/demand: BetaBotz
     if betabotz_key and not is_llm_on_cooldown("betabotz"):
         try:
-            return _call_betabotz_api(system_prompt, user_prompt)
+            short_sys = (
+                "Kamu adalah Mina, AI Co-Host TikTok Live yang sopan dan santai. "
+                "Jawab komentar penonton secara singkat (1-2 kalimat), tanpa markdown/bintang, tanpa perkenalan diri."
+            )
+            return _call_betabotz_api(short_sys, user_prompt, music_mode=False)
         except Exception:
             pass
 
+    # 3. Cadangan kedua: OpenRouter
     if openrouter_client and not is_llm_on_cooldown("openrouter"):
         or_models = []
         if openrouter_custom_model:
             or_models.append(openrouter_custom_model)
-        or_models.extend([
-            "deepseek/deepseek-chat-v3-0324:free",
-            "meta-llama/llama-3.3-70b-instruct:free",
-            "qwen/qwen-2.5-72b-instruct:free",
-            "google/gemma-3-27b-it:free",
-            "openrouter/free",
-        ])
+        or_models.extend(_get_live_openrouter_free_models())
         dedup_or = list(dict.fromkeys(or_models))
         try:
             return _call_openrouter(
                 dedup_or,
                 system_prompt,
                 user_prompt,
-                json_mode=json_mode,
                 temperature=temperature,
                 max_tokens=max_tokens,
             )
@@ -286,7 +390,7 @@ def classify_qa_durability(question: str, answer: str) -> str:
     )
 
     try:
-        raw = call_llm_cascade("", prompt, json_mode=False, temperature=0.1, max_tokens=32)
+        raw = call_llm_cascade("", prompt, json_mode=False, temperature=0.1, max_tokens=64)
         ans = raw.strip().upper()
         if "SEMENTARA" in ans:
             return "sementara"
@@ -346,16 +450,19 @@ def parse_agent_json(raw_text: str) -> dict:
         try:
             parsed = json.loads(cleaned[start:end + 1])
             if isinstance(parsed, dict) and "action" in parsed:
+                if parsed.get("reply_text"):
+                    parsed["reply_text"] = _sanitize_plain_reply(str(parsed["reply_text"]), max_sentences=3)
                 return parsed
         except json.JSONDecodeError:
             pass
 
+    short_reply = _sanitize_plain_reply(cleaned, max_sentences=2)
     return {
         "intent": "obrolan_umum",
-        "action": "CHAT_AI",
-        "thought": "Ekstraksi teks langsung",
+        "action": "CHAT_AI" if short_reply else "IGNORE",
+        "thought": "Ekstraksi teks singkat",
         "memory_note": "",
-        "reply_text": cleaned,
+        "reply_text": short_reply,
     }
 
 
@@ -420,36 +527,36 @@ def run_moderator_reasoning(user_id: str, user_name: str, comment: str) -> dict:
 
 
 def generate_autoplay_next_song(seed_query: str, last_played: str | None, history: list[str]) -> str:
-    history_text = ", ".join(history[-15:]) if history else "Belum ada"
-    last_info = f' (baru saja memutar: "{last_played}")' if last_played else ""
+    history_text = ", ".join(history[-10:]) if history else "Belum ada"
+    last_info = f' (baru diputar: "{last_played}")' if last_played else ""
 
-    prompt = (
-        f'Lagu acuan terakhir dari pengguna: "{seed_query}"{last_info}.\n'
-        f'Daftar lagu yang SUDAH diputar (JANGAN pilih lagu yang sama atau mirip judulnya dengan daftar ini): [{history_text}].\n\n'
-        'Tugas: Rekomendasikan SATU lagu tunggal (bukan full album, kompilasi, atau playlist 1 jam) yang memiliki vibes, genre, tempo, dan karakter musisi yang sangat dekat dengan lagu acuan di atas. '
-        'Jika lagu acuan adalah musisi indie/rock/pop Indonesia (misalnya .Feast, Hindia, Perunggu, Lomba Sihir, Reality Club, Nadin Amizah, Pamungkas, Sal Priadi, Tulus, dan sejenisnya), pilih lagu lain dari musisi tersebut atau musisi Indonesia lain dengan vibes yang sama. '
-        'Jika lagu acuan berbahasa Inggris/Jepang/instrumen/lofi, sesuaikan dengan artis dan vibes yang sejenis.\n'
-        'Balas HANYA dengan format: Judul Lagu - Nama Artis (tanpa tanda kutip, tanpa nomor, tanpa penjelasan).'
+    logic_prompt = (
+        "Output ONLY 1 song in exact format: Song Title - Artist Name. "
+        "No greeting, no intro, no explanation, no numbering."
+    )
+    user_prompt = (
+        f'Give 1 song similar in vibe to "{seed_query}"{last_info}, '
+        f'not in [{history_text}]. Format: Song Title - Artist Name'
     )
 
     candidate = ""
-    try:
-        raw = call_llm_cascade("", prompt, json_mode=False, temperature=0.8, max_tokens=256)
-        lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
-        if lines:
-            candidate = lines[0].strip('"\'*-.0123456789 ')
-    except Exception as e:
-        TermUI.log("WARN", f"Autoplay LLM fallback: {e}")
+    if betabotz_key and not is_llm_on_cooldown("betabotz"):
+        try:
+            raw = _call_betabotz_api(logic_prompt, user_prompt, music_mode=True)
+            if _is_valid_song_candidate(raw):
+                candidate = raw
+        except Exception as e:
+            TermUI.log("WARN", f"Autoplay BetaBotz fallback ke variasi lokal: {e}")
 
     if not candidate:
-        suffixes = ["acoustic", "cover", "live version", "official audio", "instrumental"]
+        suffixes = ["acoustic", "cover", "live version", "official audio", "lofi"]
         candidate = f"{seed_query} {random.choice(suffixes)}"
 
     return candidate
 
 
 def transcribe_voice_note(audio_bytes: bytes, mime_type: str) -> str:
-    if not gemini_client:
+    if not gemini_clients:
         raise RuntimeError("GEMINI_API_KEY belum terpasang untuk transkripsi Voice Note.")
 
     clean_mime = mime_type.split(";")[0].strip() or "audio/ogg"
@@ -459,29 +566,29 @@ def transcribe_voice_note(audio_bytes: bytes, mime_type: str) -> str:
         "Jika suara tidak terdengar atau kosong, balas persis dengan: [TIDAK_JELAS]"
     )
 
-    for model_name in ["gemini-3.5-flash-lite", "gemini-3.8-flash"]:
-        for attempt in range(2):
+    for model_name in GEMINI_MODELS:
+        for key_idx, client in enumerate(gemini_clients, start=1):
+            cd_key = f"gemini:k{key_idx}:{model_name}"
+            if is_llm_on_cooldown(cd_key):
+                continue
             try:
-                res = gemini_client.models.generate_content(
+                res = client.models.generate_content(
                     model=model_name,
                     contents=[
                         prompt,
                         types.Part.from_bytes(data=audio_bytes, mime_type=clean_mime),
                     ],
-                    config=types.GenerateContentConfig(
-                        http_options=types.HttpOptions(timeout=14000),
-                    ),
                 )
                 return (res.text or "").strip()
             except Exception as e:
-                TermUI.log("WARN", f"STT {model_name} percobaan {attempt + 1} gagal: {e}")
-                time.sleep(0.6)
+                set_llm_cooldown(cd_key, e, f"STT {model_name}")
 
-    raise RuntimeError("Gagal mentranskripsi Voice Note karena server Gemini sibuk.")
+    raise RuntimeError("Gagal mentranskripsi Voice Note karena kuota/server Gemini sibuk.")
 
 
 def normalize_for_speech(text: str) -> str:
     cleaned = text.replace("\n", ", ").replace("/", " atau ").replace("*", "")
+    cleaned = re.sub(r"[^\w\s.,!?'-]", " ", cleaned)
     return " ".join(cleaned.split())
 
 
@@ -489,9 +596,9 @@ def split_sentences_for_tts(text: str) -> list[str]:
     speech_text = normalize_for_speech(text)
     if not speech_text:
         return []
-    raw_parts = [p.strip() for p in re.split(r"(?<=[.!?])\s+", speech_text) if p.strip()]
+    raw_parts = [p.strip() for p in re.split(r"(?<=[.!?])\s+", speech_text) if re.search(r"[a-zA-Z0-9]", p)]
     if len(raw_parts) <= 1:
-        return raw_parts
+        return raw_parts[:3]
 
     merged = []
     for part in raw_parts:
@@ -499,7 +606,7 @@ def split_sentences_for_tts(text: str) -> list[str]:
             merged[-1] = f"{merged[-1]} {part}"
         else:
             merged.append(part)
-    return merged
+    return merged[:3]
 
 
 async def generate_neural_edgetts(text: str) -> io.BytesIO:
@@ -521,16 +628,21 @@ def generate_backup_gtts(text: str) -> io.BytesIO:
 
 
 async def synthesize_chunk_fast(sentence: str) -> io.BytesIO | None:
+    if not re.search(r"[a-zA-Z0-9]", sentence):
+        return None
+
     try:
-        stream = await asyncio.wait_for(generate_neural_edgetts(sentence), timeout=1.6)
+        stream = await asyncio.wait_for(generate_neural_edgetts(sentence), timeout=5.0)
         if stream.getbuffer().nbytes > 0:
             return stream
     except Exception:
         pass
+
     try:
-        return await asyncio.wait_for(asyncio.to_thread(generate_backup_gtts, sentence), timeout=5.0)
+        return await asyncio.wait_for(asyncio.to_thread(generate_backup_gtts, sentence), timeout=7.0)
     except Exception as e:
-        TermUI.log("WARN", f"TTS gagal mensintesis segmen: {e}")
+        err_detail = str(e) or type(e).__name__
+        TermUI.log("WARN", f"TTS gagal mensintesis segmen: {err_detail}")
         return None
 
 
@@ -543,10 +655,8 @@ async def speak_to_vbcable(text: str, ensure_audio_fn=None):
         ensure_audio_fn()
 
     t_tts = time.time()
-    synth_tasks = [asyncio.create_task(synthesize_chunk_fast(s)) for s in sentences]
-
-    for idx, task in enumerate(synth_tasks):
-        audio_stream = await task
+    for idx, sentence in enumerate(sentences):
+        audio_stream = await synthesize_chunk_fast(sentence)
         if audio_stream is None or audio_stream.getbuffer().nbytes == 0:
             continue
         if idx == 0:
