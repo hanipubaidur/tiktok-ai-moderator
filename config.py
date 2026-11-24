@@ -15,12 +15,16 @@ load_dotenv()
 BOOT_TIME = time.time()
 DATASET_FILE = "dataset.json"
 VIEWERS_DB_FILE = "viewers_db.json"
+SESSION_STATS_FILE = "session_stats.json"
 LIVE_QUEUE_TXT_FILE = "live_music_queue.txt"
 OVERLAY_HOST = "0.0.0.0"
 OVERLAY_PORT = 8765
 NEURAL_VOICE = "id-ID-GadisNeural"
 
 gemini_key = os.getenv("GEMINI_API_KEY", "").strip()
+gemini_keys_raw = os.getenv("GEMINI_API_KEYS", "").strip() or gemini_key
+gemini_key_list = list(dict.fromkeys(k.strip() for k in gemini_keys_raw.split(",") if k.strip()))
+
 betabotz_key = os.getenv("BETABOTZ_API_KEY", "").strip()
 openrouter_key = os.getenv("OPENROUTER_API_KEY", "").strip()
 openrouter_custom_model = os.getenv("OPENROUTER_MODEL", "").strip()
@@ -53,6 +57,7 @@ latest_comment_token = {"id": 0}
 seen_comments: set[str] = set()
 followed_users: set[str] = set()
 shared_users_cooldown: dict[str, float] = {}
+welcomed_users_cooldown: dict[str, float] = {}
 user_music_cooldown: dict[str, float] = {}
 
 room_chat_history: deque[str] = deque(maxlen=16)
@@ -66,10 +71,18 @@ last_escalated_question: dict[str, str | int | None] = {
 }
 
 live_session_stats = {
+    "room_id": 0,
+    "host_username": tiktok_username,
+    "is_live_active": False,
+    "updated_at": "",
     "total_likes": 0,
     "user_likes": {},
     "user_gifts": {},
     "gift_totals": {},
+    "live_started_at": 0.0,
+    "total_likes": 0,
+    "top_likers": {},
+    "top_gifters": {},
 }
 
 music_pending_items: list[dict] = []
@@ -100,6 +113,7 @@ state = {
     "tiktok_connected": False,
     "tiktok_started": False,
     "last_like_shoutout": 0.0,
+    "last_join_shoutout": 0.0,
     "reconnect_delay": 5,
     "last_llm_used": "-",
     "audio_device": "-",
@@ -253,8 +267,9 @@ class TermUI:
 
 def get_active_llm_providers_label() -> str:
     names = []
-    if gemini_key:
-        names.append("Gemini")
+    if gemini_key_list:
+        tag = f"Gemini ({len(gemini_key_list)} keys)" if len(gemini_key_list) > 1 else "Gemini"
+        names.append(tag)
     if betabotz_key:
         names.append("BetaBotz")
     if openrouter_key:
@@ -272,14 +287,20 @@ def is_llm_on_cooldown(key: str) -> bool:
     return True
 
 
-def set_llm_cooldown(key: str, error_obj: Exception, label: str):
+def set_llm_cooldown(key: str, error_obj: Exception, label: str, override_seconds: float | None = None):
     err_str = str(error_obj).lower()
-    if any(code in err_str for code in ("402", "insufficient balance", "401", "invalid_api_key", "unauthorized")):
+    if override_seconds is not None:
+        seconds = override_seconds
+    elif "free-models-per-day" in err_str or "daily limit" in err_str:
+        seconds = 3600.0
+    elif any(code in err_str for code in ("402", "insufficient balance", "401", "invalid_api_key", "unauthorized")):
         seconds = 1800.0
-    elif any(code in err_str for code in ("503", "unavailable", "429", "rate limit", "quota", "timeout", "timed out")):
-        seconds = 60.0
-    else:
+    elif any(code in err_str for code in ("503", "unavailable", "429", "rate limit", "quota")):
+        seconds = 45.0
+    elif any(code in err_str for code in ("504", "deadline", "timeout", "timed out")):
         seconds = 25.0
+    else:
+        seconds = 20.0
 
     already = is_llm_on_cooldown(key)
     llm_cooldowns[key] = time.time() + seconds

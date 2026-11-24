@@ -38,6 +38,15 @@ def format_duration_mmss(seconds: int | float) -> str:
     return f"{mins:02d}:{rem:02d}"
 
 
+def format_live_duration(seconds: int | float) -> str:
+    sec = max(0, int(seconds))
+    hours, rem = divmod(sec, 3600)
+    mins, secs = divmod(rem, 60)
+    if hours > 0:
+        return f"{hours:02d}:{mins:02d}:{secs:02d}"
+    return f"{mins:02d}:{secs:02d}"
+
+
 def format_wait_minutes(seconds: int | float) -> str:
     sec = max(0, int(seconds))
     if sec < 45:
@@ -107,7 +116,17 @@ def get_live_dashboard_snapshot() -> dict:
         )
     ]
 
+    is_live_active = bool(live_session_stats.get("is_live_active", False))
+    live_started_at = float(live_session_stats.get("live_started_at") or 0.0)
+    live_elapsed_sec = max(0, int(now - live_started_at)) if (is_live_active and live_started_at > 0) else 0
+
     return {
+        "live_session": {
+            "is_active": is_live_active,
+            "started_at": live_started_at,
+            "elapsed_sec": live_elapsed_sec,
+            "duration_str": format_live_duration(live_elapsed_sec),
+        },
         "now_playing": {
             "title": curr_item.get("title") if curr_item else None,
             "requester": curr_item.get("requester") if curr_item else None,
@@ -134,6 +153,11 @@ def sync_live_queue_file(snap: dict | None = None):
     try:
         snap = snap or get_live_dashboard_snapshot()
         lines = []
+        ls = snap.get("live_session") or {}
+        if ls.get("is_active"):
+            lines.append(f"🔴 DURASI LIVE: {ls.get('duration_str', '00:00')}")
+            lines.append("")
+
         np = snap["now_playing"]
         if np:
             lines.append(
@@ -158,7 +182,7 @@ def sync_live_queue_file(snap: dict | None = None):
             lines.append(f"Belum ada antrean ({ap_note})")
 
         lines.append("")
-        lines.append("Ketik !play <judul lagu> di chat untuk request!")
+        lines.append("Ketik req <judul lagu> atau !play <judul lagu> di chat untuk request!")
 
         with open(LIVE_QUEUE_TXT_FILE, "w", encoding="utf-8") as f:
             f.write("\n".join(lines))
@@ -271,7 +295,15 @@ OVERLAY_HTML = """<!DOCTYPE html>
     display: flex;
     justify-content: space-between;
     align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
     flex-shrink: 0;
+  }
+  .header-pills {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex-wrap: wrap;
   }
   .badge {
     font-size: 13px;
@@ -308,6 +340,33 @@ OVERLAY_HTML = """<!DOCTYPE html>
     background: rgba(244, 114, 182, 0.15);
     color: #f9a8d4;
     border-color: rgba(244, 114, 182, 0.3);
+  }
+  .pill.live-timer {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    background: rgba(239, 68, 68, 0.16);
+    color: #fca5a5;
+    border-color: rgba(239, 68, 68, 0.38);
+    font-variant-numeric: tabular-nums;
+  }
+  .pill.live-timer.offline {
+    background: rgba(100, 116, 139, 0.16);
+    color: #94a3b8;
+    border-color: rgba(148, 163, 184, 0.24);
+  }
+  .live-rec-dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: #ef4444;
+    box-shadow: 0 0 8px #ef4444;
+    animation: pulse 1.3s infinite;
+  }
+  .pill.live-timer.offline .live-rec-dot {
+    background: #64748b;
+    box-shadow: none;
+    animation: none;
   }
   .np-box {
     background: rgba(30, 41, 59, 0.85);
@@ -561,13 +620,19 @@ OVERLAY_HTML = """<!DOCTYPE html>
   <div class="panel">
     <div class="header">
       <div class="badge"><div id="dot" class="dot idle"></div> LIVE MUSIC QUEUE</div>
-      <div id="apPill" class="pill">AUTOPLAY: ON</div>
+      <div class="header-pills">
+        <div id="liveTimerPill" class="pill live-timer offline" title="Total durasi sesi live (tetap jalan saat reconnect, reset saat End Live)">
+          <span class="live-rec-dot"></span>
+          <span id="liveTimerText">LIVE 00:00</span>
+        </div>
+        <div id="apPill" class="pill">AUTOPLAY: ON</div>
+      </div>
     </div>
     <div class="np-box">
       <div class="np-label">Sedang Diputar</div>
       <div id="npTitle" class="np-title">Menunggu request lagu...</div>
       <div class="np-meta">
-        <span id="npReq">Ketik !play &lt;judul&gt;</span>
+        <span id="npReq">Ketik req &lt;judul&gt; atau !play &lt;judul&gt;</span>
         <span id="npTime">00:00 / 00:00</span>
       </div>
       <div class="bar-bg"><div id="npBar" class="bar-fill"></div></div>
@@ -579,7 +644,7 @@ OVERLAY_HTML = """<!DOCTYPE html>
     <div id="qList" class="scroll-list">
       <div class="empty">Antrean kosong</div>
     </div>
-    <div class="footer">Ketik <span>!play &lt;judul lagu&gt;</span> di komentar untuk request</div>
+    <div class="footer">Ketik <span>req &lt;judul&gt;</span> / <span>!play &lt;judul&gt;</span> • <span>skip</span> • <span>!delqueue</span> di komentar</div>
   </div>
 
   <div class="right-col">
@@ -611,6 +676,37 @@ if (new URLSearchParams(location.search).get('chroma') === '1') {
   document.body.classList.add('chroma');
 }
 
+let liveSessionState = {
+  isActive: false,
+  startedAt: 0
+};
+
+function formatLiveClock(totalSec) {
+  const s = Math.max(0, Math.floor(totalSec));
+  const hrs = Math.floor(s / 3600);
+  const mins = Math.floor((s % 3600) / 60);
+  const secs = s % 60;
+  const pad = (n) => String(n).padStart(2, '0');
+  return hrs > 0 ? `${pad(hrs)}:${pad(mins)}:${pad(secs)}` : `${pad(mins)}:${pad(secs)}`;
+}
+
+function updateLiveDurationUI() {
+  const pill = document.getElementById('liveTimerPill');
+  const text = document.getElementById('liveTimerText');
+  if (!pill || !text) return;
+
+  if (liveSessionState.isActive && liveSessionState.startedAt > 0) {
+    const elapsed = (Date.now() / 1000) - liveSessionState.startedAt;
+    pill.classList.remove('offline');
+    text.textContent = 'LIVE ' + formatLiveClock(elapsed);
+  } else {
+    pill.classList.add('offline');
+    text.textContent = 'LIVE 00:00';
+  }
+}
+
+setInterval(updateLiveDurationUI, 1000);
+
 async function removeQueueItem(uid) {
   try {
     await fetch('/api/remove', {
@@ -622,6 +718,12 @@ async function removeQueueItem(uid) {
 }
 
 function renderDashboard(data) {
+  if (data.live_session) {
+    liveSessionState.isActive = Boolean(data.live_session.is_active);
+    liveSessionState.startedAt = Number(data.live_session.started_at || 0);
+    updateLiveDurationUI();
+  }
+
   const dot = document.getElementById('dot');
   const apPill = document.getElementById('apPill');
   const npTitle = document.getElementById('npTitle');
@@ -781,6 +883,16 @@ function renderDashboard(data) {
   }
 }
 
+async function hydrateInitialSnapshot() {
+  try {
+    const res = await fetch('/api/queue', { cache: 'no-store' });
+    if (res.ok) {
+      const data = await res.json();
+      renderDashboard(data);
+    }
+  } catch (e) {}
+}
+
 function connectSSE() {
   const es = new EventSource('/api/events');
   es.onmessage = (ev) => {
@@ -792,6 +904,7 @@ function connectSSE() {
   };
 }
 
+hydrateInitialSnapshot();
 connectSSE();
 </script>
 </body>
