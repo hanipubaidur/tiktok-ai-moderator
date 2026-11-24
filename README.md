@@ -11,10 +11,16 @@ Asisten AI otonom berbasis Python yang berperan sebagai **Co-Host**, **Moderator
   - Memahami alur percakapan sebelumnya dari masing-masing penonton maupun obrolan *room* secara keseluruhan, serta menyimpan profil kunjungan dan fakta penonton secara otomatis ke `viewers_db.json`.
   - **Keseimbangan Topik 50:50 & Gaya Bicara Natural:** Pertanyaan di luar tema *live* tetap dijawab akurat sesuai pengetahuan AI lalu ditutup dengan tawaran halus untuk lanjut membahas topik tersebut atau kembali ke tema utama—tanpa mengarang fakta (*anti-plenger*) dan tidak berlebihan.
 - **Multi-Provider LLM Cascade:** Mendukung fallback otomatis berantai dari **Google Gemini** (`gemini-3.5-flash-lite` / `gemini-3.8-flash`) $\rightarrow$ **BetaBotz API** $\rightarrow$ **OpenRouter** (model `:free`) lengkap dengan sistem *cooldown* cerdas saat terjadi limit atau gangguan jaringan.
-- **Moderasi Otomatis 3-Strike & Auto-Enforce Ban:** Mendeteksi kata kasar (*badword*) secara instan, memberikan peringatan suara bertingkat (Strike 1 hingga 3), serta mengeksekusi **Mute**, **Kick**, atau **Permanent Ban** secara otomatis maupun manual.
-- **Background Pre-Fetch Music Queue & Vibe Autoplay:** Penonton dapat me-request lagu langsung dari kolom komentar TikTok. Sistem mengunduh dan mengonversi hingga 3 lagu berikutnya di latar belakang saat lagu aktif diputar sehingga pergantian lagu berjalan **tanpa jeda tunggu**. Jika antrean kosong, AI otomatis memilihkan lagu berikutnya yang se-vibe dengan lagu terakhir.
-- **Live Stream Dashboard (SSE Real-Time):** Dashboard web lokal di `http://127.0.0.1:8765` (mendukung mode *Chroma Key* `/?chroma=1`) yang menampilkan **Antrean Musik (Scrollable + status Pre-Load)**, **Top Like Leaderboard**, **Top Gifter Leaderboard**, serta **Rekap Total Masing-Masing Gift** secara *real-time*.
-- **Kontrol Penuh via Discord & Terminal Dashboard:** Dilengkapi panel tombol interaktif Discord, pengiriman *Voice Note* (otomatis ditranskrip dan dibacakan AI ke *live*), sistem eskalasi pertanyaan penting ke host, serta tampilan terminal *full-width* yang bersih.
+- **Moderasi Otomatis 3-Strike, Webcast Session Probing & Auto-Enforce Ban:**
+  - Mendeteksi kata kasar (*badword*) secara instan dan memberikan peringatan suara bertingkat (Strike 1 hingga 3).
+  - Mengeksekusi **Mute**, **Kick**, atau **Permanent Ban** langsung ke endpoint regional Webcast Web TikTok dengan *auto-probing* cookie sesi (`ttwid` & `msToken`), serta otomatis memblokir interaksi/mengeluarkan ulang akun yang sudah masuk daftar `banned_users`.
+- **Background Pre-Fetch Music Queue & Vibe Autoplay:**
+  - Penonton dapat me-request, melewati (`skip`), maupun membatalkan (`!delqueue`) lagu miliknya sendiri langsung dari kolom komentar TikTok.
+  - Sistem mengunduh dan mengonversi hingga 3 lagu berikutnya di latar belakang saat lagu aktif diputar sehingga pergantian lagu berjalan **tanpa jeda tunggu**. Jika antrean kosong, AI otomatis memilihkan lagu berikutnya yang se-vibe dengan lagu terakhir.
+- **Live Stream Dashboard (SSE Real-Time) & Durasi Live Persisten:**
+  - Dashboard web lokal di `http://127.0.0.1:8765` (mendukung mode *Chroma Key* `/?chroma=1`) yang menampilkan **Timer Total Durasi Live**, **Antrean Musik (Scrollable + status Pre-Load)**, **Top Like Leaderboard**, **Top Gifter Leaderboard**, serta **Rekap Total Masing-Masing Gift** secara *real-time*.
+  - Data durasi live dan leaderboard tersimpan otomatis sehingga **tidak ter-reset saat koneksi WebSocket reconnect maupun saat bot di-restart**, dan hanya di-reset ke `00:00` ketika sesi siaran benar-benar berakhir (*Pure End Live*).
+- **Kontrol Penuh via Discord, Komentar Live Host & Terminal Dashboard:** Dilengkapi panel tombol interaktif Discord, pengiriman *Voice Note* (otomatis ditranskrip dan dibacakan AI ke *live*), perintah cepat langsung dari chat TikTok akun Host, sistem eskalasi pertanyaan penting ke host, serta tampilan terminal *full-width* yang bersih.
 
 ---
 
@@ -23,15 +29,16 @@ Asisten AI otonom berbasis Python yang berperan sebagai **Co-Host**, **Moderator
 ```text
 tiktok-ai-moderator/
 ├── .env                    # Konfigurasi API key, token Discord, & akun TikTok Host
-├── dataset.json            # Konteks live, badword, FAQ, & memori QA host
+├── dataset.json            # Konteks live, badword, banned_users, FAQ, & memori QA host
 ├── viewers_db.json         # Otomatis dibuat: database kunjungan, catatan, like & gift viewer
-├── live_music_queue.txt    # Otomatis dibuat: sinkronisasi teks antrean musik untuk OBS
+├── live_session_stats.json # Otomatis dibuat: state durasi live & leaderboard tahan reconnect
+├── live_music_queue.txt    # Otomatis dibuat: sinkronisasi teks durasi & antrean musik untuk OBS
 ├── config.py               # Konstanta, state global, deteksi Host, LLM cooldown, & TermUI
-├── storage.py              # Manajemen dataset.json, viewers_db.json, riwayat chat & statistik
+├── storage.py              # Manajemen dataset.json, viewers_db.json, sesi live & statistik
 ├── overlay_dashboard.py    # Server HTTP/SSE & antarmuka Live Stream Dashboard
 ├── ai_moderator.py         # LLM Cascade (Gemini -> BetaBotz -> OpenRouter), STT & TTS
 ├── music_engine.py         # Audio VB-Cable, Background Pre-Downloader, & Autoplay AI
-└── main.py                 # Entry point: event TikTokLive & bot kontrol Discord
+└── main.py                 # Entry point: event TikTokLive, Webcast Mod API & bot Discord
 ```
 
 ---
@@ -53,10 +60,10 @@ tiktok-ai-moderator/
                                    └──► [Live Dashboard :8765] ──► OBS / Window Capture
 ```
 
-1. **Penangkapan & Filter Event (`main.py`):** `TikTokLive` memantau komentar, gift, follow, like, dan share secara *real-time*. Komentar dari akun Host langsung ditandai sebagai `[HOST]` dan dicatat ke memori konteks tanpa dibalas AI.
+1. **Penangkapan & Filter Event (`main.py`):** `TikTokLive` memantau komentar, gift, follow, like, share, dan status *End Live* secara *real-time*. Komentar dari akun Host langsung ditandai sebagai `[HOST]` dan dapat menjalankan perintah kontrol cepat maupun dicatat ke memori konteks tanpa dibalas AI.
 2. **Pemrosesan & Keputusan AI (`ai_moderator.py` & `storage.py`):** Komentar penonton melewati filter *badword* lokal dan pencocokan memori permanen (`dataset.json`). Jika lolos, komentar diproses bersama riwayat obrolan penonton dan profil dari `viewers_db.json` melalui rantai **Gemini $\rightarrow$ BetaBotz $\rightarrow$ OpenRouter** untuk menentukan aksi (`CHAT_AI`, `HYPE`, `WARN`, `DEFLECT`, atau `ESCALATE`).
 3. **Pre-Fetch & Mixing Audio Lokal (`music_engine.py`):** Worker latar belakang menyiapkan file `.wav` untuk antrean lagu berikutnya terlebih dahulu. Suara AI diputar pada saluran mixer utama, sementara musik diputar pada saluran terpisah (`Channel 1`) dan dikirim ke **CABLE Input**.
-4. **Penyiaran & Live Dashboard (`overlay_dashboard.py`):** Aplikasi *streaming* menangkap **CABLE Output** sebagai sumber audio dan menampilkan **Live Stream Dashboard** (antrean lagu, *Top Like*, dan *Top Gift*) secara langsung.
+4. **Penyiaran & Live Dashboard (`overlay_dashboard.py`):** Aplikasi *streaming* menangkap **CABLE Output** sebagai sumber audio dan menampilkan **Live Stream Dashboard** (timer durasi live, antrean lagu, *Top Like*, dan *Top Gift*) secara langsung.
 
 ---
 
@@ -143,18 +150,18 @@ TIKTOK_TARGET_IDC=alisg
 3. Kembali ke server Discord kamu, buat satu channel teks khusus (misalnya `#kontrol-live`), klik kanan pada nama channel tersebut $\rightarrow$ pilih **Copy Channel ID**, lalu tempel ke variabel `DISCORD_CHANNEL_ID`.
 
 #### D. Mendapatkan `TIKTOK_USERNAME`, `HOST_ALIASES` & `TIKTOK_SESSION_ID`
-1. Isi `TIKTOK_USERNAME` dengan username akun TikTok yang melakukan siaran langsung (tanpa tanda `@`), dan isi `HOST_ALIASES` dengan username maupun nama tampilan host (dipisahkan koma) agar AI tidak membalas chat milik host sendiri.
+1. Isi `TIKTOK_USERNAME` dengan username akun TikTok yang melakukan siaran langsung (tanpa tanda `@`), dan isi `HOST_ALIASES` dengan username maupun nama tampilan host (dipisahkan koma) agar AI tidak membalas chat milik host sendiri serta mengenali perintah cepat host di komentar live.
 2. **Untuk Auto Kick/Mute/Ban (`TIKTOK_SESSION_ID` — Opsional):**
-   - Buka browser (Chrome / Edge) di PC, kunjungi `https://www.tiktok.com`, dan **login menggunakan akun TikTok yang dipakai untuk Live**.
+   - Buka browser (Chrome / Edge) di PC, kunjungi `https://www.tiktok.com`, dan **login menggunakan akun TikTok yang dipakai untuk Live** (atau akun moderator live tersebut).
    - Tekan tombol **`F12`** $\rightarrow$ buka tab **Application** $\rightarrow$ menu **Cookies** $\rightarrow$ klik **`https://www.tiktok.com`**.
-   - Cari baris **`sessionid`**, salin nilainya ke variabel `TIKTOK_SESSION_ID`, dan salin nilai **`tt-target-idc`** (misalnya `alisg`) ke `TIKTOK_TARGET_IDC`.
+   - Cari baris **`sessionid`**, salin nilainya ke variabel `TIKTOK_SESSION_ID`, dan salin nilai **`tt-target-idc`** (misalnya `alisg` untuk Indonesia) ke `TIKTOK_TARGET_IDC`.
 
 ### Langkah 4: Perbarui `dataset.json` & Kustomisasi Suara (Sesuai Channel Kamu)
 Repository ini sudah menyertakan file **`dataset.json`** bawaan. Sebelum menjalankan bot, buka dan sesuaikan isinya agar cocok dengan profil siaran kamu:
 
 - **`identitas_ai`**: Ubah `nama`, `kepribadian`, dan `gaya_komunikasi` sesuai karakter AI yang kamu inginkan.
 - **`profil_host`**: Ganti `nama_panggilan`, `domisili`, dan `minat_topik` dengan data kamu sendiri.
-- **`konteks_live`**: Sesuaikan `topik_bahasan` dan `status_terbaru` *(bisa juga diubah langsung saat live via perintah `!topik` dan `!konteks` di Discord)*.
+- **`konteks_live`**: Sesuaikan `topik_bahasan` dan `status_terbaru` *(bisa juga diubah langsung saat live via perintah `!topik` dan `!konteks` di Discord maupun chat live)*.
 - **`protokol_moderasi`**: Atur `tindakan_otomatis_strike_3` (`"kick"`, `"mute"`, atau `"ban"`).
 - **`daftar_badword` & `faq`**: Tambahkan atau hapus daftar kata terlarang serta pertanyaan yang sering ditanyakan penonton beserta jawabannya.
 
@@ -187,13 +194,17 @@ python main.py
 ## Panduan Perintah (Commands)
 
 ### Perintah Penonton (Komentar TikTok Live)
-- `!play <judul lagu>` / `req <judul lagu>` / `m!p <judul lagu>` — Menambahkan lagu ke antrean pemutar musik (langsung di-download di latar belakang) dan memperbarui patokan *vibes* Autoplay.
+- `!play <judul lagu>` / `req <judul lagu>` / `request <judul lagu>` / `play <judul lagu>` / `m!p <judul lagu>` — Menambahkan lagu ke antrean pemutar musik (langsung di-download di latar belakang) dan memperbarui patokan *vibes* Autoplay.
+- `skip` / `!skip` — Melewati lagu yang sedang diputar *(hanya berlaku untuk lagu request milik sendiri)*.
+- `!delqueue` / `!hapuslagu` / `!cancel` / `!batal` — Menghapus lagu dari daftar antrean *(hanya berlaku untuk lagu antrean milik sendiri)*.
 
-### Perintah Host (Channel Kontrol Discord)
+### Perintah Host (Channel Kontrol Discord & Komentar Live Host)
+
+> **Catatan:** Perintah musik, konteks (`!topik`, `!konteks`, `!say`), mute suara AI (`!mute`, `!unmute`), dan moderasi (`!kick`, `!muteuser`, `!ban`, `!unban`) juga dapat diketik **langsung di kolom komentar TikTok Live** menggunakan akun Host.
 
 #### Konteks Live, Suara & Memori AI
-- **Kirim Voice Note:** Otomatis ditranskrip oleh Gemini dan dibacakan oleh AI ke *live* (sekaligus menjawab pertanyaan eskalasi jika ada).
-- **Balas Teks Biasa:** Jika ada pertanyaan eskalasi yang menunggu, balasan teks kamu langsung dibacakan AI ke *live* dan disimpan ke memori.
+- **Kirim Voice Note (Discord):** Otomatis ditranskrip oleh Gemini dan dibacakan oleh AI ke *live* (sekaligus menjawab pertanyaan eskalasi jika ada).
+- **Balas Teks Biasa (Discord):** Jika ada pertanyaan eskalasi yang menunggu, balasan teks kamu langsung dibacakan AI ke *live* dan disimpan ke memori.
 - `!topik <tema baru>` — Mengubah fokus topik obrolan utama AI.
 - `!konteks <aktivitas>` — Memperbarui situasi *live* saat ini dan membersihkan memori sementara lama.
 - `!say <kalimat>` — Memerintahkan AI membacakan teks secara langsung ke *live* dan memperbarui konteks.
@@ -204,9 +215,9 @@ python main.py
 #### Pemutar Musik & Live Dashboard
 - `!play <judul lagu>` / `m!p <judul lagu>` — Memutar lagu atau menambahkannya ke antrean pre-fetch serta menyetel patokan *vibes* Autoplay.
 - `!queue` — Menampilkan lagu yang sedang diputar, daftar antrean beserta status `SIAP` / `LOADING`, link dashboard, dan menu *dropdown* untuk menghapus lagu dari antrean.
-- `!delqueue <nomor / judul>` *(alias: `!hapuslagu`, `!remqueue`, `!hapusantrean`)* — Menghapus lagu dari antrean berdasarkan nomor urut (`!delqueue 2`, `!delqueue 2 3`, `!delqueue 2-4`) atau judul/nama peminta.
+- `!delqueue <nomor / judul / all>` *(alias: `!hapuslagu`, `!remqueue`, `!hapusantrean`)* — Menghapus lagu dari antrean berdasarkan nomor urut (`!delqueue 2`, `!delqueue 2 3`, `!delqueue 2-4`), judul/nama peminta, atau `all` untuk mengosongkan antrean.
 - `!autoplay` (`on` / `off`) — Mengaktifkan atau mematikan pemutaran lagu otomatis yang se-vibe saat antrean kosong.
-- `!skipmusic` / `!nextsong` — Melewati lagu yang sedang diputar.
+- `!skipmusic` / `!nextsong` (atau `skip` di chat live Host) — Melewati lagu yang sedang diputar.
 - `!stopmusic` — Menghentikan musik, mengosongkan antrean serta *buffer* pre-fetch, dan menjeda Autoplay.
 - `!vol <1-100>` — Mengatur volume musik latar di VB-Cable (default `25`).
 - `!openoverlay` / `!overlay` — Membuka jendela **Live Stream Dashboard** (tambahkan `chroma` di belakangnya untuk latar hijau).
@@ -219,5 +230,5 @@ python main.py
 - `!addbadword <kata>` / `!delbadword <kata>` — Menambah atau menghapus kata dari filter sensor `daftar_badword`.
 - `!mute` / `!unmute` — Membisukan atau mengaktifkan kembali suara AI Moderator.
 - `!clear` — Membersihkan layar terminal dan menggambar ulang header dashboard utama.
-- `!reconnect` — Memulai ulang koneksi ke server TikTok Live dan mereset statistik sesi.
+- `!reconnect` — Memulai ulang koneksi ke server TikTok Live tanpa mereset timer durasi live maupun leaderboard *Top Like & Gift* (reset otomatis hanya terjadi saat *End Live*).
 - `!status` / `!panel` — Menampilkan status sistem terkini atau memunculkan ulang panel kontrol tombol.
