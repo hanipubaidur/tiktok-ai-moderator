@@ -23,7 +23,7 @@
     "topik_bahasan": "Obrolan santai dan tema sesuai sesi live",
     "status_terbaru": "turutin semua permintaan dari viewer, gunakan LLM mu untuk menjawab semua pertanyaan asal tidak melanggar rules. jawabannya full, panjang gpp asal ga lebih dari 1 paragraf",
     "mode_interaksi": "Host memantau di balik layar, AI aktif memimpin obrolan dan menjaga ketertiban room",
-    "diperbarui_pada": "2026-11-23 19:44"
+    "diperbarui_pada": "2026-11-23 20:42"
   },
   "protokol_moderasi": {
     "batas_maksimal_warn": 3,
@@ -449,7 +449,6 @@
     "gaga",
     "tarantado",
     "ulol",
-    "bobo",
     "tanga",
     "pakyu",
     "hayop ka",

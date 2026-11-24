@@ -1,5 +1,6 @@
 import os
 import re
+import time
 import json
 from collections import deque
 from datetime import datetime
@@ -7,7 +8,9 @@ from difflib import SequenceMatcher
 from config import (
     DATASET_FILE,
     VIEWERS_DB_FILE,
+    SESSION_STATS_FILE,
     HOST_IDENTIFIERS,
+    tiktok_username,
     TermUI,
     room_chat_history,
     user_chat_threads,
@@ -78,6 +81,116 @@ def save_viewers_db():
             json.dump(db, f, ensure_ascii=False, indent=2)
     except Exception as e:
         TermUI.log("WARN", f"Gagal menyimpan {VIEWERS_DB_FILE}: {e}")
+
+
+def save_session_stats():
+    live_session_stats["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    tmp_path = f"{SESSION_STATS_FILE}.tmp"
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(live_session_stats, f, ensure_ascii=False, indent=2)
+        os.replace(tmp_path, SESSION_STATS_FILE)
+    except Exception as e:
+        TermUI.log("WARN", f"Gagal menyimpan {SESSION_STATS_FILE}: {e}")
+
+
+def load_session_stats():
+    live_session_stats.setdefault("live_started_at", 0.0)
+    if not os.path.exists(SESSION_STATS_FILE):
+        return
+    try:
+        with open(SESSION_STATS_FILE, "r", encoding="utf-8") as f:
+            saved = json.load(f)
+        if not isinstance(saved, dict):
+            return
+
+        saved_host = str(saved.get("host_username") or "").strip().lower()
+        curr_host = (tiktok_username or "").strip().lower()
+        if saved_host and curr_host and saved_host != curr_host:
+            reset_session_stats()
+            return
+
+        live_session_stats["room_id"] = int(saved.get("room_id") or 0)
+        live_session_stats["host_username"] = tiktok_username
+        live_session_stats["is_live_active"] = bool(saved.get("is_live_active", False))
+        live_session_stats["live_started_at"] = float(saved.get("live_started_at") or 0.0)
+        live_session_stats["updated_at"] = str(saved.get("updated_at") or "")
+        live_session_stats["total_likes"] = int(saved.get("total_likes") or 0)
+        live_session_stats["user_likes"] = (
+            saved.get("user_likes") if isinstance(saved.get("user_likes"), dict) else {}
+        )
+        live_session_stats["user_gifts"] = (
+            saved.get("user_gifts") if isinstance(saved.get("user_gifts"), dict) else {}
+        )
+        live_session_stats["gift_totals"] = (
+            saved.get("gift_totals") if isinstance(saved.get("gift_totals"), dict) else {}
+        )
+    except Exception as e:
+        TermUI.log("WARN", f"Gagal memuat {SESSION_STATS_FILE}: {e}")
+
+
+def reset_session_stats():
+    live_session_stats["room_id"] = 0
+    live_session_stats["host_username"] = tiktok_username
+    live_session_stats["is_live_active"] = False
+    live_session_stats["live_started_at"] = 0.0
+    live_session_stats["total_likes"] = 0
+    live_session_stats["user_likes"].clear()
+    live_session_stats["user_gifts"].clear()
+    live_session_stats["gift_totals"].clear()
+    _session_counted_viewers.clear()
+    save_session_stats()
+
+
+def sync_live_session_room(room_id: int) -> bool:
+    """
+    Sinkronisasi room_id saat ConnectEvent.
+    Mempertahankan total durasi live & leaderboard saat reconnect ke room yang sama.
+    Mengembalikan True jika sesi live baru terdeteksi dan stats di-reset.
+    """
+    was_reset = False
+    prev_room_id = int(live_session_stats.get("room_id") or 0)
+    was_active = bool(live_session_stats.get("is_live_active", False))
+    prev_started_at = float(live_session_stats.get("live_started_at") or 0.0)
+    has_existing_data = bool(
+        live_session_stats["total_likes"] > 0
+        or live_session_stats["user_likes"]
+        or live_session_stats["user_gifts"]
+    )
+
+    if not was_active and has_existing_data:
+        reset_session_stats()
+        was_reset = True
+    elif room_id > 0 and prev_room_id > 0 and room_id != prev_room_id:
+        reset_session_stats()
+        was_reset = True
+
+    if room_id > 0:
+        live_session_stats["room_id"] = room_id
+    live_session_stats["host_username"] = tiktok_username
+    live_session_stats["is_live_active"] = True
+
+    if was_reset or not was_active or prev_started_at <= 0.0:
+        live_session_stats["live_started_at"] = time.time()
+
+    save_session_stats()
+    return was_reset
+
+
+def mark_live_session_ended() -> bool:
+    """
+    Dipanggil hanya saat live benar-benar berakhir (End Live).
+    Membersihkan durasi sesi & leaderboard dan mengembalikan True jika memang ada sesi yang diakhiri.
+    """
+    had_session = bool(
+        live_session_stats.get("is_live_active")
+        or float(live_session_stats.get("live_started_at") or 0.0) > 0.0
+        or live_session_stats["total_likes"] > 0
+        or live_session_stats["user_likes"]
+        or live_session_stats["user_gifts"]
+    )
+    reset_session_stats()
+    return had_session
 
 
 def get_clean_nickname(user_obj) -> str:
@@ -156,6 +269,15 @@ def register_viewer(user_obj, is_chat: bool = False):
         profile["chat_count"] = int(profile.get("chat_count", 0)) + 1
         if profile["chat_count"] % 5 == 0:
             save_viewers_db()
+
+
+def is_returning_viewer(unique_id: str) -> bool:
+    key = (unique_id or "").lower().strip()
+    db = load_viewers_db()
+    profile = db.get(key)
+    if not profile:
+        return False
+    return int(profile.get("visit_count", 1)) >= 2 or int(profile.get("chat_count", 0)) >= 1
 
 
 def add_viewer_memory_note(unique_id: str, note: str):
@@ -253,6 +375,8 @@ def record_viewer_like(user_obj, delta_count: int = 1, room_total: int = 0):
     if key in db:
         db[key]["total_likes"] = int(db[key].get("total_likes", 0)) + inc
 
+    save_session_stats()
+
 
 def record_viewer_gift(user_obj, gift_name: str, count: int = 1):
     if not user_obj:
@@ -288,13 +412,7 @@ def record_viewer_gift(user_obj, gift_name: str, count: int = 1):
         user_db_gifts[clean_gift] = int(user_db_gifts.get(clean_gift, 0)) + qty
         save_viewers_db()
 
-
-def reset_session_stats():
-    live_session_stats["total_likes"] = 0
-    live_session_stats["user_likes"].clear()
-    live_session_stats["user_gifts"].clear()
-    live_session_stats["gift_totals"].clear()
-    _session_counted_viewers.clear()
+    save_session_stats()
 
 
 def resolve_target_viewer(query: str) -> dict | None:

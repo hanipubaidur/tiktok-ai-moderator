@@ -269,6 +269,101 @@ def remove_queued_songs(spec: str) -> list[dict]:
     return removed
 
 
+def remove_user_queued_songs(requester_id: str, spec: str = "") -> tuple[list[dict], str]:
+    """
+    Menghapus antrean lagu khusus milik requester_id tertentu.
+    Mengembalikan (daftar_lagu_terhapus, status_kode):
+    - status_kode: "OK", "EMPTY_USER_QUEUE", atau "NOT_OWNER"
+    """
+    owner_key = (requester_id or "").strip().lower()
+    if not owner_key or not music_pending_items:
+        return [], "EMPTY_USER_QUEUE"
+
+    raw = (spec or "").strip()
+    user_indices = [
+        idx for idx, item in enumerate(music_pending_items)
+        if (item.get("requester_id") or "").strip().lower() == owner_key
+    ]
+
+    if not raw:
+        if not user_indices:
+            return [], "EMPTY_USER_QUEUE"
+        target_idx = user_indices[-1]
+        removed = [music_pending_items.pop(target_idx)]
+        remove_wav_file(removed[0].get("wav_path"))
+        broadcast_queue_update()
+        return removed, "OK"
+
+    if raw.lower() in ("all", "semua"):
+        if not user_indices:
+            return [], "EMPTY_USER_QUEUE"
+        removed = []
+        remaining = []
+        for idx, item in enumerate(music_pending_items):
+            if idx in user_indices:
+                removed.append(item)
+            else:
+                remaining.append(item)
+        music_pending_items[:] = remaining
+        for item in removed:
+            remove_wav_file(item.get("wav_path"))
+        broadcast_queue_update()
+        return removed, "OK"
+
+    if re.fullmatch(r"\d+", raw):
+        pos = int(raw)
+        if 1 <= pos <= len(music_pending_items):
+            target_item = music_pending_items[pos - 1]
+            if (target_item.get("requester_id") or "").strip().lower() != owner_key:
+                return [], "NOT_OWNER"
+            removed = [music_pending_items.pop(pos - 1)]
+            remove_wav_file(removed[0].get("wav_path"))
+            broadcast_queue_update()
+            return removed, "OK"
+        return [], "EMPTY_USER_QUEUE"
+
+    kw = raw.lower()
+    matched_other = False
+    removed = []
+    remaining = []
+    for item in music_pending_items:
+        title_l = (item.get("title") or "").lower()
+        query_l = (item.get("query") or "").lower()
+        is_match = kw in title_l or kw in query_l
+        if is_match:
+            if (item.get("requester_id") or "").strip().lower() == owner_key:
+                removed.append(item)
+            else:
+                matched_other = True
+                remaining.append(item)
+        else:
+            remaining.append(item)
+
+    if removed:
+        music_pending_items[:] = remaining
+        for item in removed:
+            remove_wav_file(item.get("wav_path"))
+        broadcast_queue_update()
+        return removed, "OK"
+
+    if matched_other:
+        return [], "NOT_OWNER"
+    return [], "EMPTY_USER_QUEUE"
+
+
+def can_user_skip_current_song(requester_id: str, is_host: bool = False) -> tuple[bool, str]:
+    curr = music_state.get("current_item")
+    if curr is None:
+        return False, "NO_SONG"
+    if is_host:
+        return True, "OK"
+    owner_key = (requester_id or "").strip().lower()
+    curr_owner = (curr.get("requester_id") or "").strip().lower()
+    if owner_key and curr_owner and owner_key == curr_owner:
+        return True, "OK"
+    return False, "NOT_OWNER"
+
+
 def remove_queued_song_by_uid(uid: int) -> dict | None:
     for idx, item in enumerate(music_pending_items):
         if item.get("uid") == uid:
@@ -359,6 +454,7 @@ async def music_prefetch_worker():
                         "query": next_song,
                         "title": next_song,
                         "requester": "Autoplay AI",
+                        "requester_id": "__autoplay__",
                         "duration": 210,
                         "webpage_url": "",
                         "status": "downloading",
@@ -457,6 +553,7 @@ async def music_player_worker():
                         "query": next_song,
                         "title": next_song,
                         "requester": "Autoplay AI",
+                        "requester_id": "__autoplay__",
                         "duration": 210,
                         "webpage_url": "",
                         "status": "queued",
@@ -579,15 +676,17 @@ def ensure_music_workers_running():
         _prefetch_worker_task = asyncio.create_task(music_prefetch_worker())
 
 
-def enqueue_song(requester_name: str, song_query: str):
+def enqueue_song(requester_name: str, song_query: str, requester_id: str = ""):
     ensure_music_workers_running()
     music_state["stop_flag"] = False
     music_state["last_seed_query"] = song_query
+    owner_key = (requester_id or requester_name).strip().lower()
     song_item = {
         "uid": next(song_id_counter),
         "query": song_query,
         "title": song_query,
         "requester": requester_name,
+        "requester_id": owner_key,
         "duration": 210,
         "webpage_url": "",
         "status": "queued",

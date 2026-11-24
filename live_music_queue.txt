@@ -1,9 +1,6 @@
-🎵 NOW PLAYING: NOA - LET GO feat. JEON WOONG (AB6IX)【Official Music Video】 (Req: Autoplay AI) [03:11/04:07]
+🎵 NOW PLAYING: Tidak ada lagu diputar
 
-📋 ANTREAN MUSIK (4 LAGU):
-#1. Rizky Febian & Adrian Khalif - Alamak (Official Lyric Video) | Req: Host (Someone) | ~1 mnt [SIAP]
-#2. MAGIC! - Rude (Official Video) | Req: Host (Someone) | ~5 mnt [SIAP]
-#3. ILLIT (아일릿) ‘Magnetic’ Official MV | Req: Host (Someone) | ~8 mnt [SIAP]
-#4. cupid twin version | Req: Host (Someone) | ~12 mnt
+📋 ANTREAN MUSIK (0 LAGU):
+Belum ada antrean (Antrean kosong)
 
-Ketik !play <judul lagu> di chat untuk request!
+Ketik req <judul lagu> atau !play <judul lagu> di chat untuk request!

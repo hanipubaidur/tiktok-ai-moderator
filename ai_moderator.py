@@ -16,7 +16,7 @@ from openai import OpenAI
 
 from config import (
     NEURAL_VOICE,
-    gemini_key,
+    gemini_key_list,
     betabotz_key,
     openrouter_key,
     openrouter_custom_model,
@@ -37,7 +37,10 @@ from storage import (
     add_viewer_memory_note,
 )
 
-GEMINI_MODELS = ["gemini-3.5-flash-lite"]
+GEMINI_MODELS = [
+    "gemini-3.5-flash-lite",
+    "gemini-3.8-flash",
+]
 
 _openrouter_free_cache: dict = {
     "models": [],
@@ -45,15 +48,22 @@ _openrouter_free_cache: dict = {
 }
 
 
+def _apply_gemini_cooldown(cd_key: str, err: Exception, label: str):
+    err_low = str(err).lower()
+    if "404" in err_low or "not_found" in err_low:
+        cd_sec = 3600.0
+    else:
+        cd_sec = 10.0
+    set_llm_cooldown(cd_key, err, label, override_seconds=cd_sec)
+
+
 def _build_gemini_clients() -> list[genai.Client]:
-    raw_multi = os.getenv("GEMINI_API_KEYS", "").strip() or (gemini_key or "").strip()
-    keys = [k.strip() for k in raw_multi.split(",") if k.strip()]
     return [
         genai.Client(
             api_key=k,
-            http_options=types.HttpOptions(timeout=20000),
+            http_options=types.HttpOptions(timeout=10000),
         )
-        for k in dict.fromkeys(keys)
+        for k in gemini_key_list
     ]
 
 
@@ -63,7 +73,7 @@ openrouter_client = (
     OpenAI(
         api_key=openrouter_key,
         base_url="https://openrouter.ai/api/v1",
-        timeout=12.0,
+        timeout=8.0,
         max_retries=0,
         default_headers={
             "HTTP-Referer": "https://localhost",
@@ -73,6 +83,21 @@ openrouter_client = (
     if openrouter_key
     else None
 )
+
+
+def are_all_llms_on_cooldown() -> bool:
+    gemini_ready = any(
+        not is_llm_on_cooldown(f"gemini:k{k_idx}:{m}")
+        for m in GEMINI_MODELS
+        for k_idx in range(1, len(gemini_clients) + 1)
+    )
+    if gemini_ready:
+        return False
+    if betabotz_key and not is_llm_on_cooldown("betabotz"):
+        return False
+    if openrouter_client and not is_llm_on_cooldown("openrouter"):
+        return False
+    return True
 
 
 def _strip_reasoning_tags(text: str) -> str:
@@ -90,23 +115,40 @@ def _sanitize_plain_reply(text: str, max_sentences: int = 2) -> str:
     return shortened
 
 
-def _is_valid_song_candidate(text: str) -> bool:
+def _is_provider_error_text(text: str) -> bool:
     if not text:
+        return True
+    low = text.lower()
+    error_markers = (
+        "unlimitedai.chat",
+        "layanan ai saat ini dibatasi",
+        "pembatasan kuota",
+        "silakan coba lagi nanti",
+        "beban tinggi atau pembatasan",
+        "rate limit exceeded",
+        "too many requests",
+        "service unavailable",
+        "error code:",
+        "apikey",
+        "invalid api key",
+    )
+    return any(m in low for m in error_markers)
+
+
+def _is_valid_song_candidate(text: str) -> bool:
+    if not text or _is_provider_error_text(text):
         return False
     low = text.lower()
     blocked_phrases = (
         "halo!",
         "halo,",
         "saya adalah",
-        "unlimitedai",
         "membantu anda",
         "sebagai ai",
         "rekomendasi lagu",
         "berikut adalah",
         "tentu,",
         "maaf,",
-        "apikey",
-        "invalid",
     )
     if any(b in low for b in blocked_phrases):
         return False
@@ -122,7 +164,7 @@ def _get_live_openrouter_free_models() -> list[str]:
 
     discovered = []
     try:
-        with httpx.Client(timeout=6.0) as http:
+        with httpx.Client(timeout=5.0) as http:
             resp = http.get("https://openrouter.ai/api/v1/models")
             if resp.status_code == 200:
                 items = resp.json().get("data", [])
@@ -142,7 +184,7 @@ def _get_live_openrouter_free_models() -> list[str]:
     discovered.sort(
         key=lambda m: next((i for i, kw in enumerate(preferred_keywords) if kw in m.lower()), 99)
     )
-    final_list = discovered[:6] + ["openrouter/free"]
+    final_list = discovered[:5] + ["openrouter/free"]
     _openrouter_free_cache["models"] = final_list
     _openrouter_free_cache["fetched_at"] = now
     return final_list
@@ -153,7 +195,7 @@ def _call_openrouter(
     system_prompt: str,
     user_prompt: str,
     temperature: float = 0.65,
-    max_tokens: int = 1500,
+    max_tokens: int = 800,
 ) -> str:
     if not openrouter_client or is_llm_on_cooldown("openrouter"):
         raise RuntimeError("OpenRouter tidak aktif atau sedang cooldown")
@@ -163,7 +205,7 @@ def _call_openrouter(
         messages.append({"role": "system", "content": system_prompt})
     messages.append({"role": "user", "content": user_prompt})
 
-    effective_max_tokens = max(max_tokens, 1500)
+    effective_max_tokens = max(max_tokens, 800)
 
     for model_name in models:
         cd_key = f"openrouter:{model_name}"
@@ -175,7 +217,7 @@ def _call_openrouter(
                 messages=messages,
                 temperature=temperature,
                 max_tokens=effective_max_tokens,
-                timeout=10.0,
+                timeout=8.0,
             )
 
             choices = getattr(res, "choices", None)
@@ -196,17 +238,20 @@ def _call_openrouter(
                     if m_json:
                         raw_content = m_json.group(0)
 
-            if not raw_content:
-                raise ValueError(f"{model_name} konten kosong")
+            if not raw_content or _is_provider_error_text(raw_content):
+                raise ValueError(f"{model_name} konten kosong/error")
 
             state["last_llm_used"] = f"OpenRouter ({model_name})"
             return raw_content
         except Exception as e:
             err_l = str(e).lower()
-            if any(k in err_l for k in ("402", "insufficient balance", "401", "invalid_api_key")):
-                set_llm_cooldown("openrouter", e, "OpenRouter")
+            if "free-models-per-day" in err_l or "daily limit" in err_l:
+                set_llm_cooldown("openrouter", e, "OpenRouter (Daily Limit)", override_seconds=3600.0)
                 break
-            set_llm_cooldown(cd_key, e, f"OpenRouter ({model_name})")
+            if any(k in err_l for k in ("402", "insufficient balance", "401", "invalid_api_key")):
+                set_llm_cooldown("openrouter", e, "OpenRouter", override_seconds=1800.0)
+                break
+            set_llm_cooldown(cd_key, e, f"OpenRouter ({model_name})", override_seconds=15.0)
 
     raise RuntimeError("Semua model OpenRouter gagal")
 
@@ -216,7 +261,7 @@ def _call_betabotz_api(system_prompt: str, user_prompt: str, music_mode: bool = 
         raise RuntimeError("BetaBotz tidak aktif atau sedang cooldown")
 
     base_url = "https://api.betabotz.eu.org/api/search"
-    compact_logic = (system_prompt or "Kamu adalah Mina, AI Co-Host TikTok Live. Jawab singkat maksimal 2 kalimat tanpa markdown.")[:1200]
+    compact_logic = (system_prompt or "Kamu adalah Mina, AI Co-Host TikTok Live. Jawab singkat maksimal 2 kalimat tanpa markdown.")[:1000]
 
     def extract_text(payload) -> str:
         if isinstance(payload, dict):
@@ -257,25 +302,22 @@ def _call_betabotz_api(system_prompt: str, user_prompt: str, music_mode: bool = 
             {
                 "params": {
                     "apikey": betabotz_key,
-                    "logic": compact_logic[:750],
-                    "text": user_prompt[:450],
+                    "logic": compact_logic[:650],
+                    "text": user_prompt[:400],
                 }
             },
         ),
     ]
 
-    with httpx.Client(timeout=8.0, follow_redirects=True) as http:
+    with httpx.Client(timeout=5.5, follow_redirects=True) as http:
         for ep_name, method, ep_url, req_kwargs in attempts:
             try:
                 resp = http.request(method, ep_url, **req_kwargs)
                 resp.raise_for_status()
                 raw_text = extract_text(resp.json())
 
-                if not raw_text or ("apikey" in raw_text.lower() and "invalid" in raw_text.lower()):
-                    raise ValueError(f"BetaBotz ({ep_name}) respons tidak valid/kosong")
-
-                if "unlimitedai.chat" in raw_text.lower():
-                    raise ValueError(f"BetaBotz ({ep_name}) mengembalikan teks default bot")
+                if _is_provider_error_text(raw_text):
+                    raise ValueError(f"BetaBotz ({ep_name}) mengembalikan pesan limit/error server")
 
                 if music_mode:
                     first_line = raw_text.splitlines()[0].strip('"\'*-.0123456789 ')
@@ -288,7 +330,7 @@ def _call_betabotz_api(system_prompt: str, user_prompt: str, music_mode: bool = 
             except Exception as e:
                 TermUI.log("WARN", f"BetaBotz ({ep_name}) fallback: {e}")
 
-    set_llm_cooldown("betabotz", RuntimeError("Semua endpoint BetaBotz gagal"), "BetaBotz")
+    set_llm_cooldown("betabotz", RuntimeError("Semua endpoint BetaBotz gagal/limit"), "BetaBotz", override_seconds=45.0)
     raise RuntimeError("Semua endpoint BetaBotz gagal")
 
 
@@ -297,9 +339,9 @@ def call_llm_cascade(
     user_prompt: str,
     json_mode: bool = False,
     temperature: float = 0.65,
-    max_tokens: int = 1024,
+    max_tokens: int = 768,
 ) -> str:
-    # 1. Utama untuk menyapa & moderasi chat: Gemini 3.5 Flash Lite
+    # 1. Utama: Gemini Cascade (cooldown 10s untuk error sementara, 3600s untuk 404)
     if gemini_clients:
         combined_prompt = f"{system_prompt}\n\n{user_prompt}" if system_prompt else user_prompt
         for model_name in GEMINI_MODELS:
@@ -309,44 +351,37 @@ def call_llm_cascade(
                     continue
 
                 key_tag = f"Key#{key_idx} " if len(gemini_clients) > 1 else ""
-                for attempt in range(2):
-                    try:
-                        cfg_kwargs = {
-                            "temperature": temperature,
-                            "max_output_tokens": max_tokens,
-                        }
-                        if json_mode:
-                            cfg_kwargs["response_mime_type"] = "application/json"
+                try:
+                    cfg_kwargs = {
+                        "temperature": temperature,
+                        "max_output_tokens": max_tokens,
+                    }
+                    if json_mode:
+                        cfg_kwargs["response_mime_type"] = "application/json"
 
-                        res = client.models.generate_content(
-                            model=model_name,
-                            contents=combined_prompt,
-                            config=types.GenerateContentConfig(**cfg_kwargs),
-                        )
-                        raw_content = _strip_reasoning_tags(res.text or "")
-                        if not raw_content:
-                            raise ValueError(f"{model_name} konten kosong")
-                        state["last_llm_used"] = f"Gemini {key_tag}({model_name})"
-                        return raw_content
-                    except Exception as e:
-                        err_lower = str(e).lower()
-                        is_quota = "429" in err_lower or "resource_exhausted" in err_lower
-                        is_transient = any(
-                            k in err_lower
-                            for k in ("503", "unavailable", "disconnected", "timeout", "reset")
-                        )
-                        if attempt == 0 and is_transient and not is_quota:
-                            time.sleep(0.4)
-                            continue
-                        set_llm_cooldown(cd_key, e, f"Gemini {key_tag}({model_name})")
-                        break
+                    res = client.models.generate_content(
+                        model=model_name,
+                        contents=combined_prompt,
+                        config=types.GenerateContentConfig(**cfg_kwargs),
+                    )
+                    raw_content = _strip_reasoning_tags(res.text or "")
+                    if not raw_content or _is_provider_error_text(raw_content):
+                        raise ValueError(f"{model_name} konten kosong")
+                    state["last_llm_used"] = f"Gemini {key_tag}({model_name})"
+                    return raw_content
+                except Exception as e:
+                    _apply_gemini_cooldown(cd_key, e, f"Gemini {key_tag}({model_name})")
 
-    # 2. Cadangan pertama jika Gemini 3.5 limit/demand: BetaBotz
+    # 2. Cadangan pertama: BetaBotz
     if betabotz_key and not is_llm_on_cooldown("betabotz"):
         try:
+            data = load_dataset_dict()
+            host_name = data.get("profil_host", {}).get("nama_panggilan") or "Bang Hanif"
+            topik_aktif = data.get("konteks_live", {}).get("topik_bahasan") or "Obrolan santai"
             short_sys = (
-                "Kamu adalah Mina, AI Co-Host TikTok Live yang sopan dan santai. "
-                "Jawab komentar penonton secara singkat (1-2 kalimat), tanpa markdown/bintang, tanpa perkenalan diri."
+                f"Kamu adalah Mina, AI Co-Host TikTok Live milik {host_name} (@{tiktok_username}). "
+                f"Topik live: {topik_aktif}. Jawab komentar penonton secara santai dan sopan (1-2 kalimat), "
+                "panggil nama tampilannya tanpa simbol @ atau markdown."
             )
             return _call_betabotz_api(short_sys, user_prompt, music_mode=False)
         except Exception:
@@ -370,7 +405,7 @@ def call_llm_cascade(
         except Exception as e:
             TermUI.log("ERROR", f"OpenRouter gagal: {e}")
 
-    raise RuntimeError("Semua provider LLM gagal merespons.")
+    raise RuntimeError("Semua provider LLM sedang limit/sibuk.")
 
 
 def classify_qa_durability(question: str, answer: str) -> str:
@@ -441,8 +476,8 @@ def save_learned_qa(question: str, answer: str, source: str = "discord_host", fo
 def parse_agent_json(raw_text: str) -> dict:
     cleaned = _strip_reasoning_tags(raw_text)
     cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", cleaned, flags=re.IGNORECASE).strip()
-    if not cleaned:
-        raise ValueError("Respons LLM kosong setelah pembersihan")
+    if not cleaned or _is_provider_error_text(cleaned):
+        raise ValueError("Respons LLM kosong atau pesan error provider")
 
     start = cleaned.find("{")
     end = cleaned.rfind("}")
@@ -451,12 +486,17 @@ def parse_agent_json(raw_text: str) -> dict:
             parsed = json.loads(cleaned[start:end + 1])
             if isinstance(parsed, dict) and "action" in parsed:
                 if parsed.get("reply_text"):
-                    parsed["reply_text"] = _sanitize_plain_reply(str(parsed["reply_text"]), max_sentences=3)
+                    rep = _sanitize_plain_reply(str(parsed["reply_text"]), max_sentences=3)
+                    if _is_provider_error_text(rep):
+                        return {"action": "IGNORE", "intent": "error", "thought": "Blocked error text", "reply_text": ""}
+                    parsed["reply_text"] = rep
                 return parsed
         except json.JSONDecodeError:
             pass
 
     short_reply = _sanitize_plain_reply(cleaned, max_sentences=2)
+    if _is_provider_error_text(short_reply):
+        return {"action": "IGNORE", "intent": "error", "thought": "Blocked error text", "reply_text": ""}
     return {
         "intent": "obrolan_umum",
         "action": "CHAT_AI" if short_reply else "IGNORE",
@@ -504,7 +544,7 @@ def run_moderator_reasoning(user_id: str, user_name: str, comment: str) -> dict:
         "   - ESCALATE: Kendala teknis stream atau pertanyaan real-time yang hanya bisa dijawab langsung oleh Host.\n"
         "   - IGNORE: Ketikan acak tanpa makna sama sekali.\n"
         "5. FORMAT OUTPUT:\n"
-        "   - reply_text: Bahasa Indonesia lisan yang enak didengar TTS, tanpa emoji, tanpa markdown/simbol, maksimal 3 kalimat (maks 45 kata).\n"
+        "   - reply_text: Bahasa Indonesia lisan yang enak didengar TTS, tanpa emoji, tanpa simbol @, tanpa markdown, maksimal 3 kalimat (maks 45 kata).\n"
         "   - memory_note: Jika penonton menyebut fakta tentang dirinya (misal asal kota, hobi, kesibukan), tulis ringkas 3-6 kata untuk disimpan di database; jika tidak ada, isi string kosong \"\".\n"
         'Balas JSON murni: {"intent":"...","action":"CHAT_AI|HYPE|WARN|DEFLECT|ESCALATE|IGNORE","thought":"1 kalimat singkat","memory_note":"","reply_text":"..."}'
     )
@@ -515,7 +555,7 @@ def run_moderator_reasoning(user_id: str, user_name: str, comment: str) -> dict:
         user_prompt,
         json_mode=True,
         temperature=0.65,
-        max_tokens=1024,
+        max_tokens=768,
     )
     decision = parse_agent_json(raw_content)
 
@@ -581,13 +621,13 @@ def transcribe_voice_note(audio_bytes: bytes, mime_type: str) -> str:
                 )
                 return (res.text or "").strip()
             except Exception as e:
-                set_llm_cooldown(cd_key, e, f"STT {model_name}")
+                _apply_gemini_cooldown(cd_key, e, f"STT {model_name}")
 
     raise RuntimeError("Gagal mentranskripsi Voice Note karena kuota/server Gemini sibuk.")
 
 
 def normalize_for_speech(text: str) -> str:
-    cleaned = text.replace("\n", ", ").replace("/", " atau ").replace("*", "")
+    cleaned = text.replace("\n", ", ").replace("/", " atau ").replace("*", "").replace("@", "")
     cleaned = re.sub(r"[^\w\s.,!?'-]", " ", cleaned)
     return " ".join(cleaned.split())
 
